@@ -2,13 +2,13 @@ import urllib.request
 import json
 import ssl
 import os
+import time
 import requests
 import pandas as pd
 from datetime import datetime, timedelta, timezone
 from SmartApi import SmartConnect
 import pyotp
 
-# ਇਹ ਕ੍ਰੈਡੈਂਸ਼ੀਅਲਜ਼ GitHub ਤੋਂ ਲਏ ਜਾਣਗੇ (ਕੋਡ ਵਿੱਚ ਨਹੀਂ ਲਿਖਣੇ ਪੈਣਗੇ)
 API_KEY = os.environ.get("API_KEY")
 CLIENT_ID = os.environ.get("CLIENT_ID")
 PASSWORD = os.environ.get("PASSWORD")
@@ -17,13 +17,18 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN")
 CHAT_ID = os.environ.get("CHAT_ID")
 
 INDEX_TOKENS = {
-    "NIFTY 50": {"token": "99926000", "symbol": "NIFTY", "exch": "NFO"},
-    "BANK NIFTY": {"token": "99926009", "symbol": "BANKNIFTY", "exch": "NFO"},
-    "SENSEX": {"token": "99919000", "symbol": "SENSEX", "exch": "BFO"} 
+    "NIFTY 50": {"token": "99926000", "symbol": "NIFTY", "exch": "NFO", "index_exch": "NSE", "yahoo": "^NSEI"},
+    "BANK NIFTY": {"token": "99926009", "symbol": "BANKNIFTY", "exch": "NFO", "index_exch": "NSE", "yahoo": "^NSEBANK"},
+    "SENSEX": {"token": "99919000", "symbol": "SENSEX", "exch": "BFO", "index_exch": "BSE", "yahoo": "^BSESN"} 
 }
 
+TRADES_FILE = "trades.json"
+
+def get_ist_time():
+    return datetime.now(timezone.utc) + timedelta(hours=5, minutes=30)
+
 def is_market_open():
-    now = datetime.now(timezone.utc) + timedelta(hours=5, minutes=30)
+    now = get_ist_time()
     if now.weekday() >= 5: return False
     if now.hour < 9 or (now.hour == 9 and now.minute < 15): return False
     if now.hour > 15 or (now.hour == 15 and now.minute > 30): return False
@@ -42,6 +47,21 @@ def send_telegram(text):
     except Exception as e:
         print(f"Telegram Error: {e}")
 
+# ==================== ਟ੍ਰੈਕਿੰਗ ਫਾਈਲ ਪੜ੍ਹਨਾ/ਲਿਖਣਾ ====================
+def load_trades():
+    if os.path.exists(TRADES_FILE):
+        try:
+            with open(TRADES_FILE, 'r') as f:
+                return json.load(f)
+        except:
+            pass
+    return {"active": [], "history": []}
+
+def save_trades(trades):
+    with open(TRADES_FILE, 'w') as f:
+        json.dump(trades, f, indent=4)
+
+# ==================== ਆਪਸ਼ਨ ਚੇਨ ====================
 def find_option_token(index_name, strike_price, option_type, instrument_df):
     symbol_name = INDEX_TOKENS[index_name]["symbol"]
     exch = INDEX_TOKENS[index_name]["exch"]
@@ -65,6 +85,13 @@ def find_option_token(index_name, strike_price, option_type, instrument_df):
         
     match = match[match['symbol'].str.endswith(option_type)]
     if match.empty: return None, None, None
+    
+    try:
+        match['expiry_date'] = pd.to_datetime(match['expiry'], format='%d%b%Y')
+        match = match.sort_values('expiry_date')
+    except:
+        pass
+
     closest = match.iloc[0]
     return closest['token'], closest['symbol'], exch
 
@@ -74,6 +101,7 @@ def get_option_ltp(angel, token, exch):
         if data['status']: return data['data']['ltp']
     except: return 0
 
+# ==================== ਡੇਟਾ ਫੈਚਿੰਗ ====================
 def fetch_yahoo(ticker):
     url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}?interval=1m&range=1d"
     req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
@@ -91,8 +119,7 @@ def calc_ema(prices, period):
     if not prices: return 0
     alpha = 2 / (period + 1)
     ema = prices[0]
-    for p in prices[1:]:
-        ema = (p * alpha) + (ema * (1 - alpha))
+    for p in prices[1:]: ema = (p * alpha) + (ema * (1 - alpha))
     return ema
 
 def calc_rsi_series(prices, period=14):
@@ -115,6 +142,46 @@ def calc_rsi_series(prices, period=14):
     pad = [50.0] * (len(prices) - len(rsi_vals))
     return pad + rsi_vals
 
+def check_active_trades(trades, angel):
+    """ਚੈੱਕ ਕਰੋ ਕਿ ਕੋਈ ਟ੍ਰੇਡ ਟਾਰਗੇਟ ਜਾਂ SL ਹਿੱਟ ਹੋਇਆ ਹੈ"""
+    active = trades["active"]
+    remaining = []
+    
+    for trade in active:
+        name = trade["name"]
+        token = INDEX_TOKENS[name]["token"]
+        exch = INDEX_TOKENS[name]["index_exch"]
+        
+        try:
+            res = angel.ltpData(exch, name, token)
+            current_price = res['data']['ltp'] if res['status'] else trade["entry"]
+        except:
+            current_price = trade["entry"]
+
+        status = None
+        if trade["type"] == "CE":
+            if current_price >= trade["target"]: status = "PASS (Target Hit) ✅"
+            elif current_price <= trade["sl"]: status = "FAIL (SL Hit) ❌"
+        elif trade["type"] == "PE":
+            if current_price <= trade["target"]: status = "PASS (Target Hit) ✅"
+            elif current_price >= trade["sl"]: status = "FAIL (SL Hit) ❌"
+            
+        if status:
+            trade["status"] = status
+            trade["exit_price"] = current_price
+            trades["history"].append(trade)
+            
+            emoji = "✅" if "PASS" in status else "❌"
+            msg = f"{emoji} <b>{name} ਟ੍ਰੇਡ ਬੰਦ ਹੋਇਆ!</b>\n"
+            msg += f"ਸਟੇਟਸ: {status}\n"
+            msg += f"Entry: ₹{trade['entry']:.2f} | Exit: ₹{current_price:.2f}"
+            send_telegram(msg)
+        else:
+            remaining.append(trade)
+            
+    trades["active"] = remaining
+    return trades
+
 def main():
     if not is_market_open():
         print("ਮਾਰਕੀਟ ਬੰਦ ਹੈ।")
@@ -125,29 +192,26 @@ def main():
     try:
         totp = pyotp.TOTP(TOTP_SECRET).now()
         data = angel.generateSession(CLIENT_ID, PASSWORD, totp)
-        if not data['status']:
-            print("ਲੌਗਇਨ ਫੇਲ।")
-            return
-    except Exception as e:
-        print(f"Error: {e}")
-        return
+        if not data['status']: return
+    except: return
 
     # ਡਾਟਾ ਲੋਡ ਕਰੋ
     file_path = "instruments.json"
     if not os.path.exists(file_path):
         url = "https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json"
         response = requests.get(url)
-        with open(file_path, 'wb') as f:
-            f.write(response.content)
+        with open(file_path, 'wb') as f: f.write(response.content)
             
     with open(file_path, 'r') as f:
         instrument_df = pd.DataFrame(json.load(f))
 
+    # ਟ੍ਰੇਡਸ ਲੋਡ ਕਰੋ ਅਤੇ ਪੁਰਾਣੇ ਚੈੱਕ ਕਰੋ
+    trades = load_trades()
+    trades = check_active_trades(trades, angel)
+
     print("ਸਕੈਨ ਕਰ ਰਹੇ ਹਾਂ...")
-    yahoo_map = {"NIFTY 50": "^NSEI", "BANK NIFTY": "^NSEBANK", "SENSEX": "^BSESN"}
-    
-    for name, ticker in yahoo_map.items():
-        closes = fetch_yahoo(ticker)
+    for name, info in INDEX_TOKENS.items():
+        closes = fetch_yahoo(info["yahoo"])
         if not closes or len(closes) < 30: continue
         
         ltp = closes[-1]
@@ -157,25 +221,41 @@ def main():
         rsi = rsi_series[-1]
         prev_rsi = rsi_series[-2]
 
-        # ਸਿਰਫ਼ ਤਦ ਹੀ ਅਲਰਟ ਭੇਜੋ ਜਦੋਂ RSI 60 ਤੋਂ ਉੱਪਰ ਕਰਾਸ ਕਰੇ (CE) ਜਾਂ 40 ਤੋਂ ਹੇਠਾਂ ਕਰਾਸ ਕਰੇ (PE)
         new_signal = None
         if ema9 > ema21 and prev_rsi <= 60 and rsi > 60: new_signal = "CE"
         elif ema9 < ema21 and prev_rsi >= 40 and rsi < 40: new_signal = "PE"
 
-        if new_signal:
-            step = 50 if name == "NIFTY 50" else (100 if name == "BANK NIFTY" else 100)
+        # ਜੇਕਰ ਨਵਾਂ ਸਿਗਨਲ ਹੈ ਅਤੇ ਇਸ ਇੰਡੈਕਸ ਦਾ ਪਹਿਲਾਂ ਤੋਂ ਕੋਈ ਟ੍ਰੇਡ ਚੱਲ ਰਿਹਾ ਨਹੀਂ
+        if new_signal and not any(t["name"] == name for t in trades["active"]):
+            step = 50 if name == "NIFTY 50" else 100
             strike = round((ltp + step) / step) * step if new_signal == "CE" else round((ltp - step) / step) * step
             opt_token, opt_symbol, exch = find_option_token(name, strike, new_signal, instrument_df)
             
             if opt_token:
                 premium = get_option_ltp(angel, opt_token, exch)
-                msg = f"🚀 <b>ਕਲਾਉਡ ਸਿਗਨਲ ({new_signal})</b>\n\n"
+                
+                # SL ਅਤੇ Target ਦਾ ਹਿਸਾਬ (1:3)
+                if new_signal == "CE":
+                    sl, target = ltp - (1.5 * 20), ltp + (3 * 1.5 * 20)
+                else:
+                    sl, target = ltp + (1.5 * 20), ltp - (3 * 1.5 * 20)
+
+                trade = {
+                    "name": name, "type": new_signal, "symbol": opt_symbol,
+                    "entry": ltp, "sl": sl, "target": target, "premium": premium,
+                    "time": get_ist_time().strftime("%Y-%m-%d %H:%M")
+                }
+                trades["active"].append(trade)
+                
+                msg = f"🚀 <b>ਨਵਾਂ {new_signal} ਸਿਗਨਲ (ਲਾਈਵ)</b>\n\n"
                 msg += f"📊 ਇੰਡੈਕਸ: <b>{name}</b> (₹{ltp:.2f})\n"
                 msg += f"🎯 ਸਟ੍ਰਾਈਕ: <b>{opt_symbol}</b>\n"
                 msg += f"💰 Premium: <b>₹{premium:.2f}</b>\n"
-                msg += f"📈 RSI: {rsi:.1f}"
+                msg += f"🛑 SL: ₹{sl:.2f} | 🎯 Target: ₹{target:.2f}"
                 send_telegram(msg)
-                print(f"ਅਲਰਟ ਭੇਜਿਆ: {name} - {opt_symbol}")
+
+    save_trades(trades)
+    print("ਸਕੈਨ ਪੂਰਾ ਹੋਇਆ। ਟ੍ਰੇਡਸ ਸੇਵ ਹੋ ਗਏ।")
 
 if __name__ == "__main__":
     main()
