@@ -20,7 +20,6 @@ CHAT_ID = os.environ.get("CHAT_ID")
 GIST_ID = os.environ.get("GIST_ID")
 GIST_TOKEN = os.environ.get("GIST_TOKEN")
 
-# ਧਿਆਨ ਦਿਓ: ਇੱਥੇ 'index_exch' ਸਿਰਫ਼ ਡੇਟਾ ਲੈਣ ਲਈ ਹੈ (NSE/BSE)
 INDEX_TOKENS = {
     "NIFTY 50": {"token": "99926000", "symbol": "NIFTY", "exch": "NFO", "index_exch": "NSE", "step": 50, "default_lot": 25},
     "BANK NIFTY": {"token": "99926009", "symbol": "BANKNIFTY", "exch": "NFO", "index_exch": "NSE", "step": 100, "default_lot": 15},
@@ -70,6 +69,8 @@ def fetch_angel_candles(angel, token, exch, interval):
     to_date = datetime.now().strftime("%Y-%m-%d %H:%M")
     
     try:
+        # ਰੇਟ ਲਿਮਿਟ ਤੋਂ ਬਚਣ ਲਈ 0.4 ਸਕਿੰਟ ਦਾ ਸਮਾਂ
+        time.sleep(0.4)
         data = angel.getCandleData({
             "exchange": exch,
             "symboltoken": token,
@@ -81,10 +82,14 @@ def fetch_angel_candles(angel, token, exch, interval):
         if data and data.get('status') and data.get('data'):
             df = pd.DataFrame(data['data'], columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
             
-            # ਆਖਰੀ ਕੈਂਡਲ ਦਾ ਸਮਾਂ ਕੱਢੋ
+            # ਡੇਟਾ ਟਾਈਪ ਗਲਤੀ ਤੋਂ ਬਚਣ ਲਈ ਕੀਮਤਾਂ ਨੂੰ ਸੰਖਿਆ (float) ਵਿੱਚ ਬਦਲੋ
+            numeric_cols = ['open', 'high', 'low', 'close']
+            df[numeric_cols] = df[numeric_cols].apply(pd.to_numeric, errors='coerce')
+            df = df.dropna(subset=numeric_cols)
+            
             last_time_str = "Unknown"
             if not df.empty:
-                last_ts = data['data'][-1][0] # ਟਾਈਮਸਟੈਂਪ (ਮਿਲੀਸਕਿੰਟ ਵਿੱਚ)
+                last_ts = data['data'][-1][0]
                 last_time = datetime.fromtimestamp(last_ts / 1000, timezone.utc) + timedelta(hours=5, minutes=30)
                 last_time_str = last_time.strftime("%H:%M")
                 
@@ -246,7 +251,6 @@ def main():
     current_time_str = get_ist_time().strftime("%H:%M")
 
     for name, info in INDEX_TOKENS.items():
-        # Angel One ਤੋਂ 15-ਮਿੰਟ ਅਤੇ 5-ਮਿੰਟ ਦਾ ਡੇਟਾ ਲਵੋ
         df_15, time_15 = fetch_angel_candles(angel, info["token"], info["index_exch"], "FIFTEEN_MINUTE")
         df_5, time_5 = fetch_angel_candles(angel, info["token"], info["index_exch"], "FIVE_MINUTE")
         
@@ -303,7 +307,6 @@ def main():
                     }
                     trades["active"].append(trade)
                     
-                    # ਮੈਸੇਜ ਵਿੱਚ ਸਮਾਂ ਸ਼ਾਮਲ ਕੀਤਾ ਗਿਆ ਹੈ
                     msg = f"🚀 <b>ਨਵਾਂ {new_signal} ਸਿਗਨਲ (MTF)</b>\n\n"
                     msg += f"⏰ <b>ਡੇਟਾ ਸਮਾਂ:</b> {time_5} ਵਜੇ ਦਾ (5m)\n"
                     msg += f"⏰ <b>ਅਲਰਟ ਸਮਾਂ:</b> {current_time_str} ਵਜੇ\n\n"
