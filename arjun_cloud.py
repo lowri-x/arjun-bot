@@ -63,7 +63,7 @@ def save_trades(trades):
     try: requests.patch(f"https://api.github.com/gists/{GIST_ID}", headers=headers, json=payload)
     except: pass
 
-# ==================== ਡੇਟਾ ਫੈਚਿੰਗ ====================
+# ==================== ਡੇਟਾ ਫੈਚਿੰਗ (ਟਾਈਮਸਟੈਂਪ ਦੇ ਨਾਲ) ====================
 def fetch_yahoo(ticker, interval="15m"):
     url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}?interval={interval}&range=5d"
     req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
@@ -73,12 +73,22 @@ def fetch_yahoo(ticker, interval="15m"):
             data = json.loads(response.read().decode('utf-8'))
             result = data['chart']['result'][0]
             q = result['indicators']['quote'][0]
+            timestamps = result.get('timestamp', [])
+            
+            # ਆਖਰੀ ਕੈਂਡਲ ਦਾ ਸਮਾਂ ਕੱਢੋ
+            last_time_str = "Unknown"
+            if timestamps:
+                # UTC ਟਾਈਮਸਟੈਂਪ ਨੂੰ IST ਵਿੱਚ ਬਦਲੋ
+                last_time = datetime.fromtimestamp(timestamps[-1], timezone.utc) + timedelta(hours=5, minutes=30)
+                last_time_str = last_time.strftime("%H:%M")
+            
             df = pd.DataFrame({
                 'open': q['open'], 'high': q['high'], 'low': q['low'], 'close': q['close']
             }).dropna()
-            return df
+            
+            return df, last_time_str
     except Exception:
-        return None
+        return None, None
 
 # ==================== ਇੰਡੀਕੇਟਰਜ਼ ====================
 def add_indicators(df):
@@ -165,11 +175,8 @@ def find_option_token(index_name, strike_price, option_type, instrument_df):
     match = match[match['symbol'].str.endswith(option_type)]
     if match.empty: return None, None, None, INDEX_TOKENS[index_name]["default_lot"]
     
-    # ਲਾਟ ਸਾਈਜ਼ ਸਿੱਧਾ ਐਂਜਲ ਵਨ ਫਾਈਲ ਤੋਂ ਲਵੋ, ਜੇ ਨਾ ਮਿਲੇ ਤਾਂ ਡਿਫਾਲਟ ਵਰਤੋ
-    try:
-        lot_size = int(float(match.iloc[0]['lotsize']))
-    except:
-        lot_size = INDEX_TOKENS[index_name]["default_lot"]
+    try: lot_size = int(float(match.iloc[0]['lotsize']))
+    except: lot_size = INDEX_TOKENS[index_name]["default_lot"]
         
     return match.iloc[0]['token'], match.iloc[0]['symbol'], exch, lot_size
 
@@ -212,12 +219,12 @@ def check_active_trades(trades, angel):
 def main():
     if not is_market_open(): return
 
-    vix_df = fetch_yahoo("^INDIAVIX", "1d")
+    vix_df, _ = fetch_yahoo("^INDIAVIX", "1d")
     if vix_df is None or vix_df.empty: return
     vix = vix_df['close'].iloc[-1]
     
     if vix < 10.0 or vix > 28.0:
-        print(f"VIX ({vix:.2f}) ਖਤਰਨਾਕ ਹੈ। ਟ੍ਰੇਡ ਨਹੀਂ ਕਰਾਂਗੇ।", flush=True)
+        print(f"VIX ({vix:.2f}) ਖਤਰਨਾਕ ਹੈ।", flush=True)
         return
 
     angel = SmartConnect(api_key=API_KEY)
@@ -238,9 +245,11 @@ def main():
     trades = load_trades()
     trades = check_active_trades(trades, angel)
 
+    current_time_str = get_ist_time().strftime("%H:%M")
+
     for name, info in INDEX_TOKENS.items():
-        df_15 = fetch_yahoo(info["yahoo"], "15m")
-        df_5 = fetch_yahoo(info["yahoo"], "5m")
+        df_15, time_15 = fetch_yahoo(info["yahoo"], "15m")
+        df_5, time_5 = fetch_yahoo(info["yahoo"], "5m")
         
         if df_15 is None or df_5 is None or len(df_5) < 30: continue
         
@@ -249,18 +258,15 @@ def main():
         
         c5, p5, c15 = df_5.iloc[-1], df_5.iloc[-2], df_15.iloc[-1]
         
-        # 1. 15m ਟ੍ਰੈਂਡ ਫਿਲਟਰ
         htf_bull = (c15["close"] > c15["ema21"]) and (c15["st_dir"] == 1)
         htf_bear = (c15["close"] < c15["ema21"]) and (c15["st_dir"] == -1)
         
-        # 2. 5m ਮੋਮੈਂਟਮ ਅਤੇ ADX
         adx_expanding = (c5["adx"] > 14.0) and (c5["adx"] > p5["adx"])
         bull_candle = bool(c5["pat_bull_engulf"] or c5["pat_hammer"] or (c5["close"] > p5["high"]))
         bear_candle = bool(c5["pat_bear_engulf"] or c5["pat_shooting_star"] or (c5["close"] < p5["low"]))
 
         new_signal = None
         
-        # ਸਿਗਨਲ ਦੀ ਜਾਂਚ
         if htf_bull and (c5["ema9"] > c5["ema21"]) and (52 <= c5["rsi"] <= 75) and adx_expanding and (c5["plus_di"] > c5["minus_di"]) and bull_candle:
             new_signal = "CE"
         elif htf_bear and (c5["ema9"] < c5["ema21"]) and (25 <= c5["rsi"] <= 48) and adx_expanding and (c5["minus_di"] > c5["plus_di"]) and bear_candle:
@@ -296,7 +302,10 @@ def main():
                     }
                     trades["active"].append(trade)
                     
+                    # ਮੈਸੇਜ ਵਿੱਚ ਸਮਾਂ ਸ਼ਾਮਲ ਕੀਤਾ ਗਿਆ ਹੈ
                     msg = f"🚀 <b>ਨਵਾਂ {new_signal} ਸਿਗਨਲ (MTF)</b>\n\n"
+                    msg += f"⏰ <b>ਡੇਟਾ ਸਮਾਂ:</b> {time_5} ਵਜੇ ਦਾ (5m)\n"
+                    msg += f"⏰ <b>ਅਲਰਟ ਸਮਾਂ:</b> {current_time_str} ਵਜੇ\n\n"
                     msg += f"📊 {name} (₹{c5['close']:.2f})\n"
                     msg += f"🎯 {opt_symbol}\n"
                     msg += f"💰 Entry: ₹{entry_premium:.2f}\n"
@@ -306,16 +315,16 @@ def main():
                     msg += f"💵 <b>Total Risk: ₹{risk_per_lot:.2f}</b>\n"
                     msg += f"ℹ️ ਸਥਿਤੀ: {risk_status}"
                     send_telegram(msg)
-                    print(f"-> {name}: ✅ ਸਿਗਨਲ ਮਿਲਿਆ - {new_signal}", flush=True)
+                    print(f"-> {name}: ✅ ਸਿਗਨਲ ਮਿਲਿਆ - {new_signal} (Data: {time_5})", flush=True)
             else:
                 print(f"-> {name}: ਸਟ੍ਰਾਈਕ {strike} ਨਹੀਂ ਮਿਲਿਆ।", flush=True)
         else:
-            # ਇਹ ਹਿੱਸਾ ਹੁਣ ਦੱਸੇਗਾ ਕਿ ਬੋਟ ਕੀ ਲੱਭ ਰਿਹਾ ਸੀ
             if c5["rsi"] >= 52: search_type = "CE (Call)"
             elif c5["rsi"] <= 48: search_type = "PE (Put)"
             else: search_type = "Neutral"
             
-            print(f"-> {name}: {search_type} ਲੱਭ ਰਹੇ ਹਾਂ... (RSI: {c5['rsi']:.1f}, ADX: {c5['adx']:.1f}) - ਸ਼ਰਤਾਂ ਪੂਰੀਆਂ ਨਹੀਂ ਹੋਈਆਂ", flush=True)
+            # ਲੌਗ ਵਿੱਚ ਵੀ ਡੇਟਾ ਸਮਾਂ ਦਿਖਾਓ
+            print(f"-> {name}: {search_type} ਲੱਭ ਰਹੇ ਹਾਂ... (ਡੇਟਾ: {time_5} ਵਜੇ ਦਾ | RSI: {c5['rsi']:.1f}, ADX: {c5['adx']:.1f})", flush=True)
 
     save_trades(trades)
 
