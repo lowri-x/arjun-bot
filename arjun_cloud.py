@@ -5,6 +5,7 @@ import os
 import time
 import requests
 import pandas as pd
+import numpy as np
 from datetime import datetime, timedelta, timezone
 from SmartApi import SmartConnect
 import pyotp
@@ -44,59 +45,245 @@ def send_telegram(text):
     try: urllib.request.urlopen(req, context=ctx, timeout=10)
     except Exception as e: print(f"Telegram Error: {e}", flush=True)
 
-def main():
-    print("1. ਸਿਸਟਮ ਸ਼ੁਰੂ ਹੋਇਆ...", flush=True)
-    
-    if not is_market_open():
-        print("ਮਾਰਕੀਟ ਬੰਦ ਹੈ।", flush=True)
-        return
-    print("2. ਮਾਰਕੀਟ ਖੁੱਲ੍ਹੀ ਹੈ।", flush=True)
+# ==================== GIST ਫਾਈਲ ਹੈਂਡਲਿੰਗ ====================
+def load_trades():
+    if not GIST_ID or not GIST_TOKEN: return {"active": [], "history": []}
+    headers = {"Authorization": f"token {GIST_TOKEN}"}
+    try:
+        res = requests.get(f"https://api.github.com/gists/{GIST_ID}", headers=headers)
+        if res.status_code == 200:
+            content = res.json()['files']['trades.json']['content']
+            return json.loads(content)
+    except Exception as e: print(f"Gist Read Error: {e}", flush=True)
+    return {"active": [], "history": []}
 
-    # VIX ਚੈੱਕ
-    url = "https://query1.finance.yahoo.com/v8/finance/chart/^INDIAVIX?interval=1d&range=1d"
+def save_trades(trades):
+    if not GIST_ID or not GIST_TOKEN: return
+    headers = {"Authorization": f"token {GIST_TOKEN}"}
+    payload = {"files": {"trades.json": {"content": json.dumps(trades, indent=4)}}}
+    try: requests.patch(f"https://api.github.com/gists/{GIST_ID}", headers=headers, json=payload)
+    except Exception as e: print(f"Gist Save Error: {e}", flush=True)
+
+# ==================== ਡੇਟਾ ਫੈਚਿੰਗ ====================
+def fetch_yahoo(ticker, interval="5m"):
+    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}?interval={interval}&range=1d"
     req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
     ctx = ssl.create_default_context(); ctx.check_hostname = False; ctx.verify_mode = ssl.CERT_NONE
     try:
         with urllib.request.urlopen(req, context=ctx, timeout=10) as response:
             data = json.loads(response.read().decode('utf-8'))
-            vix = data['chart']['result'][0]['indicators']['quote'][0]['close'][-1]
-            print(f"3. VIX ਕੀਮਤ: {vix}", flush=True)
-            if vix < 12.0 or vix > 25.0:
-                print(f"VIX ({vix:.2f}) ਖਤਰਨਾਕ ਲੈਵਲ 'ਤੇ ਹੈ। ਟ੍ਰੇਡ ਨਹੀਂ ਕਰਾਂਗੇ।", flush=True)
-                return
-    except Exception as e:
-        print(f"VIX ਡੇਟਾ ਫੇਲ: {e}", flush=True)
+            result = data['chart']['result'][0]
+            q = result['indicators']['quote'][0]
+            df = pd.DataFrame({'high': q['high'], 'low': q['low'], 'close': q['close']}).dropna()
+            return df
+    except: return None
+
+def calc_ema(prices, period):
+    if len(prices) < period: return 0
+    k = 2.0 / (period + 1)
+    ema = sum(prices[:period]) / period
+    for p in prices[period:]: ema = p * k + ema * (1 - k)
+    return ema
+
+def calc_rsi(prices, period=14):
+    if len(prices) < period + 1: return 50
+    gains, losses = [], []
+    for i in range(1, len(prices)):
+        diff = prices[i] - prices[i-1]
+        gains.append(max(diff, 0)); losses.append(max(-diff, 0))
+    avg_gain = sum(gains[:period]) / period; avg_loss = sum(losses[:period]) / period
+    for i in range(period, len(gains)):
+        avg_gain = (avg_gain * (period - 1) + gains[i]) / period
+        avg_loss = (avg_loss * (period - 1) + losses[i]) / period
+    if avg_loss == 0: return 100
+    return 100 - (100 / (1 + (avg_gain / avg_loss)))
+
+def calc_adx(df, period=14):
+    if len(df) < period + 1: return 0
+    highs, lows, closes = df['high'].tolist(), df['low'].tolist(), df['close'].tolist()
+    plus_dm, minus_dm, trs = [], [], []
+    for i in range(1, len(closes)):
+        up = highs[i] - highs[i-1]; down = lows[i-1] - lows[i]
+        plus_dm.append(up if up > down and up > 0 else 0)
+        minus_dm.append(down if down > up and down > 0 else 0)
+        trs.append(max(highs[i]-lows[i], abs(highs[i]-closes[i-1]), abs(lows[i]-closes[i-1])))
+    ap, am, at = sum(plus_dm[-period:])/period, sum(minus_dm[-period:])/period, sum(trs[-period:])/period
+    if at == 0: return 0
+    pdi, mdi = (ap/at)*100, (am/at)*100
+    return abs(pdi-mdi)/(pdi+mdi)*100 if (pdi+mdi)>0 else 0
+
+def find_option_token(index_name, strike_price, option_type, instrument_df):
+    symbol_name = INDEX_TOKENS[index_name]["symbol"]
+    exch = INDEX_TOKENS[index_name]["exch"]
+    target_strike = float(strike_price) * 100
+    opts = instrument_df[(instrument_df['name'] == symbol_name) & (instrument_df['instrumenttype'] == 'OPTIDX') & (instrument_df['exch_seg'] == exch)].copy()
+    if opts.empty: return None, None, None
+    opts['strike_float'] = pd.to_numeric(opts['strike'], errors='coerce')
+    match = opts[opts['strike_float'] == target_strike]
+    if match.empty:
+        avail = opts['strike_float'].dropna().unique()
+        if len(avail) == 0: return None, None, None
+        match = opts[opts['strike_float'] == min(avail, key=lambda x: abs(x - target_strike))]
+    match = match[match['symbol'].str.endswith(option_type)]
+    if match.empty: return None, None, None
+    closest = match.iloc[0]
+    return closest['token'], closest['symbol'], exch
+
+def get_option_ltp(angel, token, exch):
+    try:
+        data = angel.ltpData(exch, "", token)
+        if data['status']: return data['data']['ltp']
+    except: return 0
+
+# ==================== ਟ੍ਰੇਡ ਟ੍ਰੈਕਿੰਗ ====================
+def check_active_trades(trades, angel):
+    remaining = []
+    for trade in trades["active"]:
+        current_premium = get_option_ltp(angel, trade["opt_token"], trade["exch"])
+        if current_premium == 0:
+            remaining.append(trade)
+            continue
+
+        status = None
+        if trade["type"] == "CE":
+            if current_premium >= trade["target_premium"]: status = "PASS (Target Hit) ✅"
+            elif current_premium <= trade["sl_premium"]: status = "FAIL (SL Hit) ❌"
+        elif trade["type"] == "PE":
+            if current_premium <= trade["target_premium"]: status = "PASS (Target Hit) ✅"
+            elif current_premium >= trade["sl_premium"]: status = "FAIL (SL Hit) ❌"
+            
+        if status:
+            trade["status"] = status
+            trade["exit_premium"] = current_premium
+            trades["history"].append(trade)
+            emoji = "✅" if "PASS" in status else "❌"
+            msg = f"{emoji} <b>{trade['name']} ਟ੍ਰੇਡ ਬੰਦ ਹੋਇਆ!</b>\nਸਟੇਟਸ: {status}\nEntry: ₹{trade['entry_premium']:.2f} | Exit: ₹{current_premium:.2f}"
+            send_telegram(msg)
+            print(f"ਟ੍ਰੇਡ ਬੰਦ: {trade['name']} ({status})", flush=True)
+        else:
+            remaining.append(trade)
+    trades["active"] = remaining
+    return trades
+
+# ==================== ਮੁੱਖ ਲੂਪ ====================
+def main():
+    if not is_market_open():
+        print("ਮਾਰਕੀਟ ਬੰਦ ਹੈ। ਸਿਸਟਮ ਬੰਦ ਹੋ ਰਿਹਾ ਹੈ।", flush=True)
         return
 
-    print("4. Angel One ਨਾਲ ਜੁੜ ਰਹੇ ਹਾਂ...", flush=True)
+    vix_df = fetch_yahoo("^INDIAVIX", "1d")
+    if vix_df is None or vix_df.empty:
+        print("VIX ਡੇਟਾ ਨਹੀਂ ਮਿਲਿਆ।", flush=True)
+        return
+    vix = vix_df['close'].iloc[-1]
+    print(f"VIX ਕੀਮਤ: {vix:.2f}", flush=True)
+    
+    if vix < 10.0 or vix > 25.0:
+        print(f"VIX ({vix:.2f}) ਖਤਰਨਾਕ ਲੈਵਲ 'ਤੇ ਹੈ। ਟ੍ਰੇਡ ਨਹੀਂ ਕਰਾਂਗੇ।", flush=True)
+        return
+
+    print("Angel One ਨਾਲ ਜੁੜ ਰਹੇ ਹਾਂ...", flush=True)
     angel = SmartConnect(api_key=API_KEY)
     try:
         totp = pyotp.TOTP(TOTP_SECRET).now()
         data = angel.generateSession(CLIENT_ID, PASSWORD, totp)
-        if not data['status']:
-            print(f"ਲੌਗਇਨ ਫੇਲ: {data}", flush=True)
-            return
-        print("5. Angel One ਲੌਗਇਨ ਸਫਲ!", flush=True)
-    except Exception as e:
-        print(f"ਲੌਗਇਨ ਐਰਰ: {e}", flush=True)
-        return
+        if not data['status']: return
+        print("ਲੌਗਇਨ ਸਫਲ!", flush=True)
+    except: return
 
-    print("6. ਇੰਸਟਰੂਮੈਂਟ ਡਾਟਾ ਚੈੱਕ ਕਰ ਰਹੇ ਹਾਂ...", flush=True)
     file_path = "instruments.json"
     if not os.path.exists(file_path):
-        print("ਇੰਸਟਰੂਮੈਂਟ ਫਾਈਲ ਡਾਊਨਲੋਡ ਹੋ ਰਹੀ ਹੈ (ਇਸ ਵਿੱਚ ਸਮਾਂ ਲੱਗੇਗਾ)...", flush=True)
+        print("ਇੰਸਟਰੂਮੈਂਟ ਫਾਈਲ ਡਾਊਨਲੋਡ ਹੋ ਰਹੀ ਹੈ...", flush=True)
         url = "https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json"
-        try:
-            response = requests.get(url, timeout=30)
-            with open(file_path, 'wb') as f: f.write(response.content)
-            print("ਡਾਊਨਲੋਡ ਪੂਰਾ ਹੋਇਆ!", flush=True)
-        except Exception as e:
-            print(f"ਡਾਊਨਲੋਡ ਫੇਲ: {e}", flush=True)
-            return
+        response = requests.get(url)
+        with open(file_path, 'wb') as f: f.write(response.content)
             
-    print("7. ਸਕੈਨਿੰਗ ਸ਼ੁਰੂ ਕਰ ਰਹੇ ਹਾਂ (ਬਾਕੀ ਲਾਜਿਕ)...", flush=True)
-    # ਬਾਕੀ ਦਾ ਸਾਰਾ ਲਾਜਿਕ ਇੱਥੇ ਹੀ ਹੈ...
-    print("ਸਿਸਟਮ ਖਤਮ ਹੋਇਆ।", flush=True)
+    with open(file_path, 'r') as f:
+        instrument_df = pd.DataFrame(json.load(f))
+
+    trades = load_trades()
+    trades = check_active_trades(trades, angel)
+
+    print("ਮਾਰਕੀਟ ਸਕੈਨ ਕਰ ਰਹੇ ਹਾਂ...", flush=True)
+    
+    for name, info in INDEX_TOKENS.items():
+        print(f"-> {name} ਚੈੱਕ ਕਰ ਰਹੇ ਹਾਂ...", flush=True)
+        df = fetch_yahoo(info["yahoo"], "5m")
+        if df is None or len(df) < 30: 
+            print(f"   {name} ਲਈ ਡੇਟਾ ਘੱਟ ਹੈ।", flush=True)
+            continue
+        
+        closes = df['close'].tolist()
+        ltp = closes[-1]
+        ema9 = calc_ema(closes, 9)
+        ema21 = calc_ema(closes, 21)
+        rsi_series = [calc_rsi(closes[:i+1]) for i in range(len(closes)-2, len(closes))]
+        rsi = rsi_series[-1]
+        prev_rsi = rsi_series[-2]
+        adx = calc_adx(df, 14)
+        
+        print(f"   RSI: {rsi:.1f}, ADX: {adx:.1f}", flush=True)
+
+        new_signal = None
+        if ema9 > ema21 and prev_rsi <= 55 and rsi > 55 and adx > 20: new_signal = "CE"
+        elif ema9 < ema21 and prev_rsi >= 45 and rsi < 45 and adx > 20: new_signal = "PE"
+
+        if new_signal and not any(t["name"] == name for t in trades["active"]):
+            print(f"   🚀 ਸਿਗਨਲ ਮਿਲਿਆ: {new_signal}!", flush=True)
+            step = 50 if name == "NIFTY 50" else 100
+            strike = round((ltp + step) / step) * step if new_signal == "CE" else round((ltp - step) / step) * step
+            
+            opt_token, opt_symbol, exch = find_option_token(name, strike, new_signal, instrument_df)
+            
+            if opt_token:
+                entry_premium = get_option_ltp(angel, opt_token, exch)
+                if entry_premium > 0:
+                    sl_distance = entry_premium * 0.25 # 25% SL
+                    target_distance = sl_distance * 3  # 1:3 Target
+                    
+                    sl_premium = entry_premium - sl_distance if new_signal == "CE" else entry_premium + sl_distance
+                    target_premium = entry_premium + target_distance if new_signal == "CE" else entry_premium - target_distance
+
+                    lot_size = info["lot_size"]
+                    risk_per_lot = sl_distance * lot_size
+                    
+                    # ਰਿਸਕ ਦੇ ਹਿਸਾਬ ਨਾਲ ਐਮੋਜੀ ਅਤੇ ਚੇਤਾਵਨੀ ਤੈਅ ਕਰੋ
+                    if risk_per_lot <= 300:
+                        risk_status = "✅ ਘੱਟ ਰਿਸਕ (Low Risk)"
+                    elif risk_per_lot <= 600:
+                        risk_status = "⚠️ ਦਰਮਿਆਨਾ ਰਿਸਕ (Medium Risk)"
+                    else:
+                        risk_status = "🚨 ਵੱਧ ਰਿਸਕ (High Risk - ਧਿਆਨ ਨਾਲ!)"
+                    
+                    trade = {
+                        "name": name, "type": new_signal, "symbol": opt_symbol,
+                        "opt_token": opt_token, "exch": exch,
+                        "entry_premium": entry_premium, "sl_premium": sl_premium, 
+                        "target_premium": target_premium, "qty": lot_size,
+                        "time": get_ist_time().strftime("%Y-%m-%d %H:%M")
+                    }
+                    trades["active"].append(trade)
+                    
+                    msg = f"🚀 <b>ਨਵਾਂ {new_signal} ਸਿਗਨਲ</b>\n\n"
+                    msg += f"📊 {name} (₹{ltp:.2f})\n"
+                    msg += f"🎯 {opt_symbol}\n"
+                    msg += f"💰 Entry: ₹{entry_premium:.2f}\n"
+                    msg += f"🛑 SL: ₹{sl_premium:.2f}\n"
+                    msg += f"🎯 Target (1:3): ₹{target_premium:.2f}\n"
+                    msg += f"📦 Qty: {lot_size} (1 Lot)\n"
+                    msg += f"💵 <b>Total Risk: ₹{risk_per_lot:.2f}</b>\n"
+                    msg += f"ℹ️ ਸਥਿਤੀ: {risk_status}"
+                    send_telegram(msg)
+                    print(f"   ✅ ਅਲਰਟ ਭੇਜ ਦਿੱਤਾ ਗਿਆ: {opt_symbol} (Risk: {risk_status})", flush=True)
+                else:
+                    print(f"   ❌ ਪ੍ਰੀਮੀਅਮ 0 ਮਿਲਿਆ।", flush=True)
+            else:
+                print(f"   ❌ ਸਟ੍ਰਾਈਕ {strike} ਨਹੀਂ ਮਿਲਿਆ।", flush=True)
+        else:
+            print(f"   💤 ਕੋਈ ਸਿਗਨਲ ਨਹੀਂ ਬਣਿਆ।", flush=True)
+
+    save_trades(trades)
+    print("ਸਕੈਨ ਪੂਰਾ ਹੋਇਆ।", flush=True)
 
 if __name__ == "__main__":
     main()
