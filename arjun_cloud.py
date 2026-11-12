@@ -47,14 +47,18 @@ def send_telegram(text):
 
 # ==================== GIST ਹੈਂਡਲਿੰਗ ====================
 def load_trades():
-    if not GIST_ID or not GIST_TOKEN: return {"active": [], "history": []}
+    if not GIST_ID or not GIST_TOKEN: return {"active": [], "history": [], "last_start_msg": "", "last_end_msg": ""}
     headers = {"Authorization": f"token {GIST_TOKEN}"}
     try:
         res = requests.get(f"https://api.github.com/gists/{GIST_ID}", headers=headers)
         if res.status_code == 200:
-            return json.loads(res.json()['files']['trades.json']['content'])
+            content = json.loads(res.json()['files']['trades.json']['content'])
+            # ਜੇਕਰ ਪੁਰਾਣੀ ਫਾਈਲ ਹੈ ਤਾਂ ਨਵੀਆਂ ਕੀਜ਼ ਐਡ ਕਰੋ
+            if "last_start_msg" not in content: content["last_start_msg"] = ""
+            if "last_end_msg" not in content: content["last_end_msg"] = ""
+            return content
     except: pass
-    return {"active": [], "history": []}
+    return {"active": [], "history": [], "last_start_msg": "", "last_end_msg": ""}
 
 def save_trades(trades):
     if not GIST_ID or not GIST_TOKEN: return
@@ -68,19 +72,14 @@ def fetch_angel_candles(angel, token, exch, interval):
     from_date = (datetime.now() - timedelta(days=5)).strftime("%Y-%m-%d %H:%M")
     to_date = datetime.now().strftime("%Y-%m-%d %H:%M")
     
-    # ਜੇਕਰ API ਬਲਾਕ ਹੋਵੇ ਤਾਂ ਦੁਬਾਰਾ ਕੋਸ਼ਿਸ਼ ਕਰਨ ਲਈ ਲੂਪ
     for attempt in range(2):
         try:
-            time.sleep(3.0) # API ਬਲਾਕ ਨਾ ਕਰੇ, ਇਸ ਲਈ 3 ਸਕਿੰਟ ਦਾ ਸਮਾਂ
+            time.sleep(2.0) 
             data = angel.getCandleData({
-                "exchange": exch,
-                "symboltoken": token,
-                "interval": interval,
-                "fromdate": from_date,
-                "todate": to_date
+                "exchange": exch, "symboltoken": token, "interval": interval,
+                "fromdate": from_date, "todate": to_date
             })
             
-            # ਜੇਕਰ ਡੇਟਾ ਸਹੀ ਹੈ
             if data and isinstance(data, dict) and data.get('status') == True and isinstance(data.get('data'), list) and len(data['data']) > 0:
                 df = pd.DataFrame(data['data'], columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
                 
@@ -91,34 +90,24 @@ def fetch_angel_candles(angel, token, exch, interval):
                 last_time_str = "Unknown"
                 if not df.empty:
                     last_ts = data['data'][-1][0]
-                    
-                    # ਸਮੇਂ ਨੂੰ ਸਹੀ ਤਰ੍ਹਾਂ ਪਛਾਣੋ (ਚਾਹੇ ਉਹ ਨੰਬਰ ਹੋਵੇ ਜਾਂ ਸਟ੍ਰਿੰਗ)
                     try:
                         if isinstance(last_ts, (int, float)):
                             last_time = datetime.fromtimestamp(last_ts / 1000, timezone.utc) + timedelta(hours=5, minutes=30)
                         else:
-                            # ਜੇਕਰ ਸਟ੍ਰਿੰਗ ਹੈ (ਜਿਵੇਂ '2026-11-12T15:25:00+05:30')
                             last_time = pd.to_datetime(last_ts).tz_convert('Asia/Kolkata')
                         last_time_str = last_time.strftime("%H:%M")
-                    except:
-                        last_time_str = "Time Error"
+                    except: pass
                         
                 return df[['open', 'high', 'low', 'close']], last_time_str
             
-            # ਜੇਕਰ API ਨੇ ਬਲਾਕ ਕੀਤਾ ਹੈ
             elif isinstance(data, bytes) and b'Access denied' in data:
-                print(f"API ਬਲਾਕ ਹੈ, 5 ਸਕਿੰਟ ਇੰਤਜ਼ਾਰ ਕਰ ਰਹੇ ਹਾਂ...", flush=True)
                 time.sleep(5)
                 continue
-                
         except Exception as e:
-            if "exceeding access rate" in str(e):
-                print(f"Rate Limit ਐਰਰ, 5 ਸਕਿੰਟ ਇੰਤਜ਼ਾਰ...", flush=True)
-                time.sleep(5)
+            if "exceeding access rate" in str(e): time.sleep(5)
             else:
                 print(f"Angel API Exception ({token}): {e}", flush=True)
                 break
-                
     return None, None
 
 # ==================== ਇੰਡੀਕੇਟਰਜ਼ ====================
@@ -269,9 +258,32 @@ def main():
         instrument_df = pd.DataFrame(json.load(f))
 
     trades = load_trades()
-    trades = check_active_trades(trades, angel)
+    
+    # ==================== ਸਵੇਰ ਅਤੇ ਸ਼ਾਮ ਦੇ ਟੈਸਟ ਮੈਸੇਜ ====================
+    now = get_ist_time()
+    today_str = now.strftime("%Y-%m-%d")
+    current_time_str = now.strftime("%H:%M")
 
-    current_time_str = get_ist_time().strftime("%H:%M")
+    # 1. ਸਵੇਰ ਦਾ ਮੈਸੇਜ (ਜਦੋਂ ਬੋਟ ਦਿਨ ਵਿੱਚ ਪਹਿਲੀ ਵਾਰ ਚੱਲੇ)
+    if trades.get("last_start_msg") != today_str:
+        msg = f"✅ <b>LowriX ਬੋਟ ਚਾਲੂ ਹੋ ਗਿਆ ਹੈ!</b>\n\nਮਾਰਕੀਟ ਖੁੱਲ੍ਹ ਗਈ ਹੈ। ਬੋਟ ਹੁਣ ਲਾਈਵ ਡੇਟਾ ਸਕੈਨ ਕਰ ਰਿਹਾ ਹੈ। ਜਿਵੇਂ ਹੀ ਕੋਈ ਵਧੀਆ ਸਿਗਨਲ ਮਿਲੇਗਾ, ਤੁਹਾਨੂੰ ਇੱਥੇ ਅਲਰਟ ਮਿਲ ਜਾਵੇਗਾ।\n⏰ ਸਮਾਂ: {current_time_str}"
+        send_telegram(msg)
+        trades["last_start_msg"] = today_str
+        save_trades(trades)
+        print("ਸਵੇਰ ਦਾ ਮੈਸੇਜ ਭੇਜ ਦਿੱਤਾ ਗਿਆ।", flush=True)
+
+    # 2. ਸ਼ਾਮ ਦਾ ਮੈਸੇਜ (ਮਾਰਕੀਟ ਬੰਦ ਹੋਣ ਤੋਂ 5 ਮਿੰਟ ਪਹਿਲਾਂ)
+    if now.hour == 15 and now.minute >= 25 and trades.get("last_end_msg") != today_str:
+        total_active = len(trades["active"])
+        msg = f"🔴 <b>LowriX ਬੋਟ ਦਾ ਕੰਮ ਪੂਰਾ ਹੋਇਆ</b>\n\nਮਾਰਕੀਟ ਬੰਦ ਹੋ ਰਹੀ ਹੈ। ਬੋਟ ਹੁਣ ਅੱਜ ਲਈ ਬੰਦ ਹੋ ਗਿਆ ਹੈ।\nਕੱਲ੍ਹ ਸਵੇਰੇ 9:15 ਵਜੇ ਇਹ ਦੁਬਾਰਾ ਆਪਣੇ ਆਪ ਚਾਲੂ ਹੋ ਜਾਵੇਗਾ।\n⏰ ਸਮਾਂ: {current_time_str}"
+        send_telegram(msg)
+        trades["last_end_msg"] = today_str
+        save_trades(trades)
+        print("ਸ਼ਾਮ ਦਾ ਮੈਸੇਜ ਭੇਜ ਦਿੱਤਾ ਗਿਆ।", flush=True)
+        return # ਸ਼ਾਮ ਨੂੰ ਹੋਰ ਸਕੈਨ ਕਰਨ ਦੀ ਲੋੜ ਨਹੀਂ
+
+    # ==================== ਸਕੈਨਿੰਗ ਸ਼ੁਰੂ ====================
+    trades = check_active_trades(trades, angel)
 
     for name, info in INDEX_TOKENS.items():
         print(f"-> {name} ਲਈ ਡੇਟਾ ਲੈ ਰਹੇ ਹਾਂ...", flush=True)
