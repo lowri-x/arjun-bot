@@ -20,7 +20,7 @@ CHAT_ID = os.environ.get("CHAT_ID")
 GIST_ID = os.environ.get("GIST_ID")
 GIST_TOKEN = os.environ.get("GIST_TOKEN")
 
-# ਹੁਣ ਸਿਰਫ਼ Nifty ਅਤੇ Bank Nifty ਹੀ ਹਨ (Sensex ਹਟਾ ਦਿੱਤਾ ਗਿਆ ਹੈ)
+# ਸਿਰਫ਼ Nifty ਅਤੇ Bank Nifty
 INDEX_TOKENS = {
     "NIFTY 50": {"token": "99926000", "symbol": "NIFTY", "exch": "NFO", "index_exch": "NSE", "step": 50, "default_lot": 25},
     "BANK NIFTY": {"token": "99926009", "symbol": "BANKNIFTY", "exch": "NFO", "index_exch": "NSE", "step": 100, "default_lot": 15}
@@ -68,39 +68,57 @@ def fetch_angel_candles(angel, token, exch, interval):
     from_date = (datetime.now() - timedelta(days=5)).strftime("%Y-%m-%d %H:%M")
     to_date = datetime.now().strftime("%Y-%m-%d %H:%M")
     
-    try:
-        # API ਦੀ ਰੇਟ ਲਿਮਿਟ ਤੋਂ ਬਚਣ ਲਈ 2 ਸਕਿੰਟ ਦਾ ਸਮਾਂ
-        time.sleep(2.0) 
-        data = angel.getCandleData({
-            "exchange": exch,
-            "symboltoken": token,
-            "interval": interval,
-            "fromdate": from_date,
-            "todate": to_date
-        })
-        
-        if data and isinstance(data, dict) and data.get('status') == True and isinstance(data.get('data'), list) and len(data['data']) > 0:
-            df = pd.DataFrame(data['data'], columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+    # ਜੇਕਰ API ਬਲਾਕ ਹੋਵੇ ਤਾਂ ਦੁਬਾਰਾ ਕੋਸ਼ਿਸ਼ ਕਰਨ ਲਈ ਲੂਪ
+    for attempt in range(2):
+        try:
+            time.sleep(3.0) # API ਬਲਾਕ ਨਾ ਕਰੇ, ਇਸ ਲਈ 3 ਸਕਿੰਟ ਦਾ ਸਮਾਂ
+            data = angel.getCandleData({
+                "exchange": exch,
+                "symboltoken": token,
+                "interval": interval,
+                "fromdate": from_date,
+                "todate": to_date
+            })
             
-            numeric_cols = ['open', 'high', 'low', 'close']
-            df[numeric_cols] = df[numeric_cols].apply(pd.to_numeric, errors='coerce')
-            df = df.dropna(subset=numeric_cols)
-            
-            last_time_str = "Unknown"
-            if not df.empty:
-                last_ts = data['data'][-1][0]
-                if isinstance(last_ts, str):
-                    last_ts = float(last_ts)
+            # ਜੇਕਰ ਡੇਟਾ ਸਹੀ ਹੈ
+            if data and isinstance(data, dict) and data.get('status') == True and isinstance(data.get('data'), list) and len(data['data']) > 0:
+                df = pd.DataFrame(data['data'], columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
                 
-                last_time = datetime.fromtimestamp(last_ts / 1000, timezone.utc) + timedelta(hours=5, minutes=30)
-                last_time_str = last_time.strftime("%H:%M")
+                numeric_cols = ['open', 'high', 'low', 'close']
+                df[numeric_cols] = df[numeric_cols].apply(pd.to_numeric, errors='coerce')
+                df = df.dropna(subset=numeric_cols)
                 
-            return df[['open', 'high', 'low', 'close']], last_time_str
-        else:
-            print(f"Angel API Error ({token}): Invalid or empty data.", flush=True)
+                last_time_str = "Unknown"
+                if not df.empty:
+                    last_ts = data['data'][-1][0]
+                    
+                    # ਸਮੇਂ ਨੂੰ ਸਹੀ ਤਰ੍ਹਾਂ ਪਛਾਣੋ (ਚਾਹੇ ਉਹ ਨੰਬਰ ਹੋਵੇ ਜਾਂ ਸਟ੍ਰਿੰਗ)
+                    try:
+                        if isinstance(last_ts, (int, float)):
+                            last_time = datetime.fromtimestamp(last_ts / 1000, timezone.utc) + timedelta(hours=5, minutes=30)
+                        else:
+                            # ਜੇਕਰ ਸਟ੍ਰਿੰਗ ਹੈ (ਜਿਵੇਂ '2026-11-12T15:25:00+05:30')
+                            last_time = pd.to_datetime(last_ts).tz_convert('Asia/Kolkata')
+                        last_time_str = last_time.strftime("%H:%M")
+                    except:
+                        last_time_str = "Time Error"
+                        
+                return df[['open', 'high', 'low', 'close']], last_time_str
             
-    except Exception as e:
-        print(f"Angel API Exception ({token}): {e}", flush=True)
+            # ਜੇਕਰ API ਨੇ ਬਲਾਕ ਕੀਤਾ ਹੈ
+            elif isinstance(data, bytes) and b'Access denied' in data:
+                print(f"API ਬਲਾਕ ਹੈ, 5 ਸਕਿੰਟ ਇੰਤਜ਼ਾਰ ਕਰ ਰਹੇ ਹਾਂ...", flush=True)
+                time.sleep(5)
+                continue
+                
+        except Exception as e:
+            if "exceeding access rate" in str(e):
+                print(f"Rate Limit ਐਰਰ, 5 ਸਕਿੰਟ ਇੰਤਜ਼ਾਰ...", flush=True)
+                time.sleep(5)
+            else:
+                print(f"Angel API Exception ({token}): {e}", flush=True)
+                break
+                
     return None, None
 
 # ==================== ਇੰਡੀਕੇਟਰਜ਼ ====================
