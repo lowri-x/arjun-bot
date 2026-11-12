@@ -72,47 +72,41 @@ def fetch_angel_candles(angel, token, exch, interval):
     from_date = (now_ist - timedelta(days=5)).strftime("%Y-%m-%d %H:%M")
     to_date = now_ist.strftime("%Y-%m-%d %H:%M")
     
-    for attempt in range(3): # 3 ਵਾਰ ਕੋਸ਼ਿਸ਼ ਕਰੇਗਾ
-        try:
-            # API ਦੀ ਰੇਟ ਲਿਮਿਟ ਤੋਂ ਬਚਣ ਲਈ 3 ਸਕਿੰਟ ਦਾ ਸਮਾਂ
-            time.sleep(3.0) 
-            data = angel.getCandleData({
-                "exchange": exch, "symboltoken": token, "interval": interval,
-                "fromdate": from_date, "todate": to_date
-            })
+    try:
+        # API ਦੀ ਰੇਟ ਲਿਮਿਟ ਤੋਂ ਬਚਣ ਲਈ 2 ਸਕਿੰਟ ਦਾ ਸਮਾਂ
+        time.sleep(2.0) 
+        data = angel.getCandleData({
+            "exchange": exch, "symboltoken": token, "interval": interval,
+            "fromdate": from_date, "todate": to_date
+        })
+        
+        if data and isinstance(data, dict) and data.get('status') == True and isinstance(data.get('data'), list) and len(data['data']) > 0:
+            df = pd.DataFrame(data['data'], columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
             
-            if data and isinstance(data, dict):
-                if data.get('status') == True and isinstance(data.get('data'), list) and len(data['data']) > 0:
-                    df = pd.DataFrame(data['data'], columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+            numeric_cols = ['open', 'high', 'low', 'close']
+            df[numeric_cols] = df[numeric_cols].apply(pd.to_numeric, errors='coerce')
+            df = df.dropna(subset=numeric_cols)
+            
+            last_time_str = "Unknown"
+            if not df.empty:
+                last_ts = data['data'][-1][0]
+                try:
+                    if isinstance(last_ts, (int, float)):
+                        last_time = datetime.fromtimestamp(last_ts / 1000, timezone.utc) + timedelta(hours=5, minutes=30)
+                    else:
+                        last_time = pd.to_datetime(last_ts).tz_convert('Asia/Kolkata')
+                    last_time_str = last_time.strftime("%H:%M")
+                except: pass
                     
-                    numeric_cols = ['open', 'high', 'low', 'close']
-                    df[numeric_cols] = df[numeric_cols].apply(pd.to_numeric, errors='coerce')
-                    df = df.dropna(subset=numeric_cols)
-                    
-                    last_time_str = "Unknown"
-                    if not df.empty:
-                        last_ts = data['data'][-1][0]
-                        try:
-                            if isinstance(last_ts, (int, float)):
-                                last_time = datetime.fromtimestamp(last_ts / 1000, timezone.utc) + timedelta(hours=5, minutes=30)
-                            else:
-                                last_time = pd.to_datetime(last_ts).tz_convert('Asia/Kolkata')
-                            last_time_str = last_time.strftime("%H:%M")
-                        except: pass
-                            
-                    return df[['open', 'high', 'low', 'close']], last_time_str
-                else:
-                    # ਅਸਲੀ ਐਰਰ ਦਿਖਾਓ
-                    print(f"API Error ({token}): {data.get('message', 'Unknown Error')}", flush=True)
-                    if "exceeding access rate" in str(data).lower() or "Access denied" in str(data).lower():
-                        print("Rate limit hit, waiting 10s...", flush=True)
-                        time.sleep(10)
-                        continue
-                    break
-        except Exception as e:
-            print(f"API Exception ({token}): {e}", flush=True)
-            time.sleep(5)
-    return None, None
+            return df[['open', 'high', 'low', 'close']], last_time_str
+        else:
+            # ਜੇਕਰ API ਬਲਾਕ ਹੈ, ਤਾਂ ਸਿੱਧਾ ਬਾਹਰ ਨਿਕਲ ਜਾਓ (ਅਗਲੇ 5 ਮਿੰਟ ਵਾਲੇ ਰਨ ਦੀ ਉਡੀਕ ਕਰੋ)
+            print(f"API Error ({token}): Rate limit hit. Skipping to next cycle.", flush=True)
+            return None, None
+            
+    except Exception as e:
+        print(f"API Exception ({token}): {e}", flush=True)
+        return None, None
 
 # ==================== ਇੰਡੀਕੇਟਰਜ਼ ====================
 def add_indicators(df):
