@@ -2,13 +2,11 @@ name: Arjun Cloud Scanner
 
 on:
   schedule:
-    # ਇਹ ਸਿਰਫ਼ ਸਵੇਰੇ 9:00 ਤੋਂ ਦੁਪਹਿਰ 3:30 ਤੱਕ ਹੀ ਚੱਲੇਗਾ (ਸੋਮਵਾਰ ਤੋਂ ਸ਼ੁੱਕਰਵਾਰ)
-    # ਭਾਰਤੀ ਸਮਾਂ (IST) = UTC + 5:30
-    # 9:00 AM IST = 3:30 AM UTC
-    # 3:30 PM IST = 10:00 AM UTC
-    - cron: '*/5 3-9 * * 1-5' 
-    - cron: '0 10 * * 1-5'
-  workflow_dispatch: # ਟੈਸਟ ਲਈ
+    # ਇਹ ਸਿਰਫ਼ ਸਵੇਰੇ 9:15 ਤੋਂ ਦੁਪਹਿਰ 3:30 ਤੱਕ ਹੀ ਚੱਲੇਗਾ (IST)
+    - cron: '45,50,55 3 * * 1-5'  # 9:15 AM to 9:25 AM
+    - cron: '*/5 4-9 * * 1-5'     # 9:30 AM to 3:25 PM
+    - cron: '0 10 * * 1-5'        # 3:30 PM (ਸਿਰਫ਼ ਇੱਕ ਵਾਰ)
+  workflow_dispatch: # ਮੈਨੂਅਲ ਟੈਸਟ ਲਈ
 
 jobs:
   scan:
