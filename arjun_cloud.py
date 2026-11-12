@@ -21,9 +21,9 @@ GIST_ID = os.environ.get("GIST_ID")
 GIST_TOKEN = os.environ.get("GIST_TOKEN")
 
 INDEX_TOKENS = {
-    "NIFTY 50": {"token": "99926000", "symbol": "NIFTY", "exch": "NFO", "index_exch": "NSE", "yahoo": "^NSEI", "step": 50},
-    "BANK NIFTY": {"token": "99926009", "symbol": "BANKNIFTY", "exch": "NFO", "index_exch": "NSE", "yahoo": "^NSEBANK", "step": 100},
-    "SENSEX": {"token": "99919000", "symbol": "SENSEX", "exch": "BFO", "index_exch": "BSE", "yahoo": "^BSESN", "step": 100} 
+    "NIFTY 50": {"token": "99926000", "symbol": "NIFTY", "exch": "NFO", "index_exch": "NSE", "yahoo": "^NSEI", "step": 50, "default_lot": 25},
+    "BANK NIFTY": {"token": "99926009", "symbol": "BANKNIFTY", "exch": "NFO", "index_exch": "NSE", "yahoo": "^NSEBANK", "step": 100, "default_lot": 15},
+    "SENSEX": {"token": "99919000", "symbol": "SENSEX", "exch": "BFO", "index_exch": "BSE", "yahoo": "^BSESN", "step": 100, "default_lot": 10} 
 }
 
 def get_ist_time():
@@ -74,7 +74,7 @@ def fetch_yahoo(ticker, interval="15m"):
             result = data['chart']['result'][0]
             q = result['indicators']['quote'][0]
             df = pd.DataFrame({
-                'open': q['open'], 'high': q['high'], 'low': q['low'], 'close': q['close'], 'volume': q['volume']
+                'open': q['open'], 'high': q['high'], 'low': q['low'], 'close': q['close']
             }).dropna()
             return df
     except Exception:
@@ -88,19 +88,16 @@ def add_indicators(df):
     df["ema9"] = close.ewm(span=9, adjust=False).mean()
     df["ema21"] = close.ewm(span=21, adjust=False).mean()
     
-    # RSI
     delta = close.diff()
     gain = delta.clip(lower=0).ewm(alpha=1/14, adjust=False).mean()
     loss = (-delta.clip(upper=0)).ewm(alpha=1/14, adjust=False).mean()
     rs = gain / loss.replace(0, np.nan)
     df["rsi"] = 100 - (100 / (1 + rs))
 
-    # ATR
     prev_close = close.shift(1)
     tr = pd.concat([high - low, (high - prev_close).abs(), (low - prev_close).abs()], axis=1).max(axis=1)
     df["atr"] = tr.ewm(alpha=1/14, adjust=False).mean()
 
-    # ADX & DI
     up_move = high.diff()
     down_move = -low.diff()
     plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0.0)
@@ -112,7 +109,6 @@ def add_indicators(df):
     dx = 100 * (df["plus_di"] - df["minus_di"]).abs() / (df["plus_di"] + df["minus_di"]).replace(0, np.nan)
     df["adx"] = dx.ewm(alpha=1/14, adjust=False).mean()
 
-    # Supertrend (10, 3)
     hl2 = (high + low) / 2
     upper = (hl2 + 3.0 * df["atr"]).to_numpy()
     lower = (hl2 - 3.0 * df["atr"]).to_numpy()
@@ -133,7 +129,6 @@ def add_indicators(df):
             
     df["st_dir"] = trend
 
-    # Candlestick (Hammer & Engulfing) - Pure Python
     body = (close - open_).abs()
     candle_range = (high - low).replace(0, np.nan)
     upper_wick = high - np.maximum(open_, close)
@@ -157,21 +152,25 @@ def find_option_token(index_name, strike_price, option_type, instrument_df):
     exch = INDEX_TOKENS[index_name]["exch"]
     target_strike = float(strike_price) * 100
     opts = instrument_df[(instrument_df['name'] == symbol_name) & (instrument_df['instrumenttype'] == 'OPTIDX') & (instrument_df['exch_seg'] == exch)].copy()
-    if opts.empty: return None, None, None, 0
+    if opts.empty: return None, None, None, INDEX_TOKENS[index_name]["default_lot"]
     
     opts['strike_float'] = pd.to_numeric(opts['strike'], errors='coerce')
     match = opts[opts['strike_float'] == target_strike]
     
     if match.empty:
         avail = opts['strike_float'].dropna().unique()
-        if len(avail) == 0: return None, None, None, 0
+        if len(avail) == 0: return None, None, None, INDEX_TOKENS[index_name]["default_lot"]
         match = opts[opts['strike_float'] == min(avail, key=lambda x: abs(x - target_strike))]
         
     match = match[match['symbol'].str.endswith(option_type)]
-    if match.empty: return None, None, None, 0
+    if match.empty: return None, None, None, INDEX_TOKENS[index_name]["default_lot"]
     
-    # ਲਾਟ ਸਾਈਜ਼ ਸਿੱਧਾ ਐਂਜਲ ਵਨ ਫਾਈਲ ਤੋਂ ਲਵੋ
-    lot_size = int(match.iloc[0]['lotsize'])
+    # ਲਾਟ ਸਾਈਜ਼ ਸਿੱਧਾ ਐਂਜਲ ਵਨ ਫਾਈਲ ਤੋਂ ਲਵੋ, ਜੇ ਨਾ ਮਿਲੇ ਤਾਂ ਡਿਫਾਲਟ ਵਰਤੋ
+    try:
+        lot_size = int(float(match.iloc[0]['lotsize']))
+    except:
+        lot_size = INDEX_TOKENS[index_name]["default_lot"]
+        
     return match.iloc[0]['token'], match.iloc[0]['symbol'], exch, lot_size
 
 def get_option_ltp(angel, token, exch):
@@ -218,7 +217,7 @@ def main():
     vix = vix_df['close'].iloc[-1]
     
     if vix < 10.0 or vix > 28.0:
-        print(f"VIX ({vix:.2f}) ਖਤਰਨਾਕ ਹੈ।", flush=True)
+        print(f"VIX ({vix:.2f}) ਖਤਰਨਾਕ ਹੈ। ਟ੍ਰੇਡ ਨਹੀਂ ਕਰਾਂਗੇ।", flush=True)
         return
 
     angel = SmartConnect(api_key=API_KEY)
@@ -240,9 +239,7 @@ def main():
     trades = check_active_trades(trades, angel)
 
     for name, info in INDEX_TOKENS.items():
-        # 15-ਮਿੰਟ ਦਾ ਟ੍ਰੈਂਡ (HTF)
         df_15 = fetch_yahoo(info["yahoo"], "15m")
-        # 5-ਮਿੰਟ ਦੀ ਐਂਟਰੀ (LTF)
         df_5 = fetch_yahoo(info["yahoo"], "5m")
         
         if df_15 is None or df_5 is None or len(df_5) < 30: continue
@@ -262,6 +259,8 @@ def main():
         bear_candle = bool(c5["pat_bear_engulf"] or c5["pat_shooting_star"] or (c5["close"] < p5["low"]))
 
         new_signal = None
+        
+        # ਸਿਗਨਲ ਦੀ ਜਾਂਚ
         if htf_bull and (c5["ema9"] > c5["ema21"]) and (52 <= c5["rsi"] <= 75) and adx_expanding and (c5["plus_di"] > c5["minus_di"]) and bull_candle:
             new_signal = "CE"
         elif htf_bear and (c5["ema9"] < c5["ema21"]) and (25 <= c5["rsi"] <= 48) and adx_expanding and (c5["minus_di"] > c5["plus_di"]) and bear_candle:
@@ -276,10 +275,7 @@ def main():
             if opt_token and lot_size > 0:
                 entry_premium = get_option_ltp(angel, opt_token, exch)
                 if entry_premium > 0:
-                    # ਡਾਇਨੈਮਿਕ ATR ਸਟਾਪ ਲੌਸ (ਨਿਫਟੀ ਦੇ 15m ATR 'ਤੇ ਅਧਾਰਿਤ)
-                    # 1 ATR = ਲਗਭਗ 0.5 ਪ੍ਰੀਮੀਅਮ ਪੁਆਇੰਟ
                     atr_risk = 1.5 * c15["atr"] * 0.5
-                    # ਹਾਰਡ ਕੈਪ: 25% ਤੋਂ ਵੱਧ ਨੁਕਸਾਨ ਨਹੀਂ
                     sl_distance = min(atr_risk, entry_premium * 0.25)
                     
                     sl_premium = entry_premium - sl_distance if new_signal == "CE" else entry_premium + sl_distance
@@ -310,8 +306,16 @@ def main():
                     msg += f"💵 <b>Total Risk: ₹{risk_per_lot:.2f}</b>\n"
                     msg += f"ℹ️ ਸਥਿਤੀ: {risk_status}"
                     send_telegram(msg)
+                    print(f"-> {name}: ✅ ਸਿਗਨਲ ਮਿਲਿਆ - {new_signal}", flush=True)
+            else:
+                print(f"-> {name}: ਸਟ੍ਰਾਈਕ {strike} ਨਹੀਂ ਮਿਲਿਆ।", flush=True)
         else:
-            print(f"-> {name}: ਕੋਈ ਸਿਗਨਲ ਨਹੀਂ (RSI: {c5['rsi']:.1f}, ADX: {c5['adx']:.1f})", flush=True)
+            # ਇਹ ਹਿੱਸਾ ਹੁਣ ਦੱਸੇਗਾ ਕਿ ਬੋਟ ਕੀ ਲੱਭ ਰਿਹਾ ਸੀ
+            if c5["rsi"] >= 52: search_type = "CE (Call)"
+            elif c5["rsi"] <= 48: search_type = "PE (Put)"
+            else: search_type = "Neutral"
+            
+            print(f"-> {name}: {search_type} ਲੱਭ ਰਹੇ ਹਾਂ... (RSI: {c5['rsi']:.1f}, ADX: {c5['adx']:.1f}) - ਸ਼ਰਤਾਂ ਪੂਰੀਆਂ ਨਹੀਂ ਹੋਈਆਂ", flush=True)
 
     save_trades(trades)
 
