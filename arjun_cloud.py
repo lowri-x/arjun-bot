@@ -6,6 +6,7 @@ import time
 import requests
 import pandas as pd
 import numpy as np
+import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta, timezone
 from SmartApi import SmartConnect
 import pyotp
@@ -64,19 +65,58 @@ def save_trades(trades):
     try: requests.patch(f"https://api.github.com/gists/{GIST_ID}", headers=headers, json=payload)
     except Exception as e: print(f"Gist Save Error: {e}", flush=True)
 
+# ==================== ਗਲੋਬਲ ਮਾਰਕੀਟ ਅਤੇ ਖਬਰਾਂ ====================
+def get_global_context():
+    context = "🌍 <b>Global Market Context:</b>\n"
+    try:
+        # US Market (S&P 500)
+        us = yf_data("^GSPC", "1d")
+        us_change = ((us['close'].iloc[-1] - us['close'].iloc[-2]) / us['close'].iloc[-2]) * 100
+        context += f"- US Market (S&P 500): {us_change:+.2f}%\n"
+        
+        # USD/INR
+        inr = yf_data("INR=X", "1d")
+        inr_val = inr['close'].iloc[-1]
+        context += f"- USD/INR: ₹{inr_val:.2f}\n"
+        
+        # Crude Oil
+        crude = yf_data("CL=F", "1d")
+        crude_val = crude['close'].iloc[-1]
+        context += f"- Crude Oil: ${crude_val:.2f}\n"
+    except:
+        context += "- ਗਲੋਬਲ ਡੇਟਾ ਉਪਲਬਧ ਨਹੀਂ ਹੈ।\n"
+    
+    # ਖਬਰਾਂ (Google News RSS)
+    try:
+        news_url = "https://news.google.com/rss/search?q=Nifty+50+Stock+Market&hl=en-IN&gl=IN&ceid=IN:en"
+        req = urllib.request.Request(news_url, headers={'User-Agent': 'Mozilla/5.0'})
+        with urllib.request.urlopen(req, timeout=5) as response:
+            xml_data = response.read()
+            root = ET.fromstring(xml_data)
+            items = root.findall(".//item")
+            if items:
+                top_news = items[0].find('title').text
+                context += f"\n📰 <b>Top News:</b> {top_news[:100]}...\n"
+    except:
+        pass
+        
+    return context
+
 # ==================== ਡੇਟਾ ਫੈਚਿੰਗ ====================
-def fetch_yahoo(ticker, interval="5m"):
-    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}?interval={interval}&range=1d"
+def yf_data(ticker, interval="1mo"):
+    # ਪਿਛਲੇ 1 ਮਹੀਨੇ ਦਾ ਡੇਟਾ (ਪਿਛਲੇ ਦਿਨਾਂ ਦੇ ਹਿਸਾਬ ਲਈ)
+    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}?interval=5m&range={interval}"
     req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
     ctx = ssl.create_default_context(); ctx.check_hostname = False; ctx.verify_mode = ssl.CERT_NONE
     try:
-        with urllib.request.urlopen(req, context=ctx, timeout=10) as response:
+        with urllib.request.urlopen(req, context=ctx, timeout=15) as response:
             data = json.loads(response.read().decode('utf-8'))
             result = data['chart']['result'][0]
             q = result['indicators']['quote'][0]
             df = pd.DataFrame({'high': q['high'], 'low': q['low'], 'close': q['close']}).dropna()
             return df
-    except: return None
+    except: 
+        return None
 
 def calc_ema(prices, period):
     if len(prices) < period: return 0
@@ -126,8 +166,7 @@ def find_option_token(index_name, strike_price, option_type, instrument_df):
         match = opts[opts['strike_float'] == min(avail, key=lambda x: abs(x - target_strike))]
     match = match[match['symbol'].str.endswith(option_type)]
     if match.empty: return None, None, None
-    closest = match.iloc[0]
-    return closest['token'], closest['symbol'], exch
+    return match.iloc[0]['token'], match.iloc[0]['symbol'], exch
 
 def get_option_ltp(angel, token, exch):
     try:
@@ -159,7 +198,6 @@ def check_active_trades(trades, angel):
             emoji = "✅" if "PASS" in status else "❌"
             msg = f"{emoji} <b>{trade['name']} ਟ੍ਰੇਡ ਬੰਦ ਹੋਇਆ!</b>\nਸਟੇਟਸ: {status}\nEntry: ₹{trade['entry_premium']:.2f} | Exit: ₹{current_premium:.2f}"
             send_telegram(msg)
-            print(f"ਟ੍ਰੇਡ ਬੰਦ: {trade['name']} ({status})", flush=True)
         else:
             remaining.append(trade)
     trades["active"] = remaining
@@ -171,29 +209,23 @@ def main():
         print("ਮਾਰਕੀਟ ਬੰਦ ਹੈ। ਸਿਸਟਮ ਬੰਦ ਹੋ ਰਿਹਾ ਹੈ।", flush=True)
         return
 
-    vix_df = fetch_yahoo("^INDIAVIX", "1d")
-    if vix_df is None or vix_df.empty:
-        print("VIX ਡੇਟਾ ਨਹੀਂ ਮਿਲਿਆ।", flush=True)
-        return
+    vix_df = yf_data("^INDIAVIX", "1d")
+    if vix_df is None or vix_df.empty: return
     vix = vix_df['close'].iloc[-1]
-    print(f"VIX ਕੀਮਤ: {vix:.2f}", flush=True)
     
     if vix < 10.0 or vix > 25.0:
         print(f"VIX ({vix:.2f}) ਖਤਰਨਾਕ ਲੈਵਲ 'ਤੇ ਹੈ। ਟ੍ਰੇਡ ਨਹੀਂ ਕਰਾਂਗੇ।", flush=True)
         return
 
-    print("Angel One ਨਾਲ ਜੁੜ ਰਹੇ ਹਾਂ...", flush=True)
     angel = SmartConnect(api_key=API_KEY)
     try:
         totp = pyotp.TOTP(TOTP_SECRET).now()
         data = angel.generateSession(CLIENT_ID, PASSWORD, totp)
         if not data['status']: return
-        print("ਲੌਗਇਨ ਸਫਲ!", flush=True)
     except: return
 
     file_path = "instruments.json"
     if not os.path.exists(file_path):
-        print("ਇੰਸਟਰੂਮੈਂਟ ਫਾਈਲ ਡਾਊਨਲੋਡ ਹੋ ਰਹੀ ਹੈ...", flush=True)
         url = "https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json"
         response = requests.get(url)
         with open(file_path, 'wb') as f: f.write(response.content)
@@ -204,11 +236,15 @@ def main():
     trades = load_trades()
     trades = check_active_trades(trades, angel)
 
-    print("ਮਾਰਕੀਟ ਸਕੈਨ ਕਰ ਰਹੇ ਹਾਂ...", flush=True)
+    # 1. ਗਲੋਬਲ ਕਾਂਟੈਕਸਟ ਲਓ
+    global_ctx = get_global_context()
+    print("ਗਲੋਬਲ ਮਾਰਕੀਟ ਡੇਟਾ ਲੈ ਲਿਆ ਗਿਆ।", flush=True)
     
+    # 2. ਸਕੈਨਿੰਗ
     for name, info in INDEX_TOKENS.items():
         print(f"-> {name} ਚੈੱਕ ਕਰ ਰਹੇ ਹਾਂ...", flush=True)
-        df = fetch_yahoo(info["yahoo"], "5m")
+        df = yf_data(info["yahoo"], "1mo") # 1 ਮਹੀਨੇ ਦਾ ਡੇਟਾ
+        
         if df is None or len(df) < 30: 
             print(f"   {name} ਲਈ ਡੇਟਾ ਘੱਟ ਹੈ।", flush=True)
             continue
@@ -229,7 +265,6 @@ def main():
         elif ema9 < ema21 and prev_rsi >= 45 and rsi < 45 and adx > 20: new_signal = "PE"
 
         if new_signal and not any(t["name"] == name for t in trades["active"]):
-            print(f"   🚀 ਸਿਗਨਲ ਮਿਲਿਆ: {new_signal}!", flush=True)
             step = 50 if name == "NIFTY 50" else 100
             strike = round((ltp + step) / step) * step if new_signal == "CE" else round((ltp - step) / step) * step
             
@@ -238,8 +273,8 @@ def main():
             if opt_token:
                 entry_premium = get_option_ltp(angel, opt_token, exch)
                 if entry_premium > 0:
-                    sl_distance = entry_premium * 0.25 # 25% SL
-                    target_distance = sl_distance * 3  # 1:3 Target
+                    sl_distance = entry_premium * 0.25 
+                    target_distance = sl_distance * 3  
                     
                     sl_premium = entry_premium - sl_distance if new_signal == "CE" else entry_premium + sl_distance
                     target_premium = entry_premium + target_distance if new_signal == "CE" else entry_premium - target_distance
@@ -247,7 +282,6 @@ def main():
                     lot_size = info["lot_size"]
                     risk_per_lot = sl_distance * lot_size
                     
-                    # ਰਿਸਕ ਦੇ ਹਿਸਾਬ ਨਾਲ ਐਮੋਜੀ ਅਤੇ ਚੇਤਾਵਨੀ ਤੈਅ ਕਰੋ
                     if risk_per_lot <= 300:
                         risk_status = "✅ ਘੱਟ ਰਿਸਕ (Low Risk)"
                     elif risk_per_lot <= 600:
@@ -272,15 +306,13 @@ def main():
                     msg += f"🎯 Target (1:3): ₹{target_premium:.2f}\n"
                     msg += f"📦 Qty: {lot_size} (1 Lot)\n"
                     msg += f"💵 <b>Total Risk: ₹{risk_per_lot:.2f}</b>\n"
-                    msg += f"ℹ️ ਸਥਿਤੀ: {risk_status}"
+                    msg += f"ℹ️ ਸਥਿਤੀ: {risk_status}\n\n"
+                    msg += f"{global_ctx}" # ਗਲੋਬਲ ਡੇਟਾ ਵੀ ਨਾਲ ਭੇਜੋ
+                    
                     send_telegram(msg)
-                    print(f"   ✅ ਅਲਰਟ ਭੇਜ ਦਿੱਤਾ ਗਿਆ: {opt_symbol} (Risk: {risk_status})", flush=True)
-                else:
-                    print(f"   ❌ ਪ੍ਰੀਮੀਅਮ 0 ਮਿਲਿਆ।", flush=True)
-            else:
-                print(f"   ❌ ਸਟ੍ਰਾਈਕ {strike} ਨਹੀਂ ਮਿਲਿਆ।", flush=True)
+                    print(f"   ✅ ਅਲਰਟ ਭੇਜ ਦਿੱਤਾ ਗਿਆ: {opt_symbol}", flush=True)
         else:
-            print(f"   💤 ਕੋਈ ਸਿਗਨਲ ਨਹੀਂ ਬਣਿਆ।", flush=True)
+            print(f"   💤 ਕੋਈ ਸਿਗਨਲ ਨਹੀਂ ਬਣਿਆ। (RSI: {rsi:.1f}, ADX: {adx:.1f})", flush=True)
 
     save_trades(trades)
     print("ਸਕੈਨ ਪੂਰਾ ਹੋਇਆ।", flush=True)
