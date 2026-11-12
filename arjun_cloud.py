@@ -20,10 +20,11 @@ CHAT_ID = os.environ.get("CHAT_ID")
 GIST_ID = os.environ.get("GIST_ID")
 GIST_TOKEN = os.environ.get("GIST_TOKEN")
 
+# ਧਿਆਨ ਦਿਓ: ਇੱਥੇ 'index_exch' ਸਿਰਫ਼ ਡੇਟਾ ਲੈਣ ਲਈ ਹੈ (NSE/BSE)
 INDEX_TOKENS = {
-    "NIFTY 50": {"token": "99926000", "symbol": "NIFTY", "exch": "NFO", "index_exch": "NSE", "yahoo": "^NSEI", "step": 50, "default_lot": 25},
-    "BANK NIFTY": {"token": "99926009", "symbol": "BANKNIFTY", "exch": "NFO", "index_exch": "NSE", "yahoo": "^NSEBANK", "step": 100, "default_lot": 15},
-    "SENSEX": {"token": "99919000", "symbol": "SENSEX", "exch": "BFO", "index_exch": "BSE", "yahoo": "^BSESN", "step": 100, "default_lot": 10} 
+    "NIFTY 50": {"token": "99926000", "symbol": "NIFTY", "exch": "NFO", "index_exch": "NSE", "step": 50, "default_lot": 25},
+    "BANK NIFTY": {"token": "99926009", "symbol": "BANKNIFTY", "exch": "NFO", "index_exch": "NSE", "step": 100, "default_lot": 15},
+    "SENSEX": {"token": "99919000", "symbol": "SENSEX", "exch": "BFO", "index_exch": "BSE", "step": 100, "default_lot": 10} 
 }
 
 def get_ist_time():
@@ -63,32 +64,34 @@ def save_trades(trades):
     try: requests.patch(f"https://api.github.com/gists/{GIST_ID}", headers=headers, json=payload)
     except: pass
 
-# ==================== ਡੇਟਾ ਫੈਚਿੰਗ (ਟਾਈਮਸਟੈਂਪ ਦੇ ਨਾਲ) ====================
-def fetch_yahoo(ticker, interval="15m"):
-    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}?interval={interval}&range=5d"
-    req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
-    ctx = ssl.create_default_context(); ctx.check_hostname = False; ctx.verify_mode = ssl.CERT_NONE
+# ==================== ਡੇਟਾ ਫੈਚਿੰਗ (Angel One ਤੋਂ) ====================
+def fetch_angel_candles(angel, token, exch, interval):
+    from_date = (datetime.now() - timedelta(days=5)).strftime("%Y-%m-%d %H:%M")
+    to_date = datetime.now().strftime("%Y-%m-%d %H:%M")
+    
     try:
-        with urllib.request.urlopen(req, context=ctx, timeout=10) as response:
-            data = json.loads(response.read().decode('utf-8'))
-            result = data['chart']['result'][0]
-            q = result['indicators']['quote'][0]
-            timestamps = result.get('timestamp', [])
+        data = angel.getCandleData({
+            "exchange": exch,
+            "symboltoken": token,
+            "interval": interval,
+            "fromdate": from_date,
+            "todate": to_date
+        })
+        
+        if data and data.get('status') and data.get('data'):
+            df = pd.DataFrame(data['data'], columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
             
             # ਆਖਰੀ ਕੈਂਡਲ ਦਾ ਸਮਾਂ ਕੱਢੋ
             last_time_str = "Unknown"
-            if timestamps:
-                # UTC ਟਾਈਮਸਟੈਂਪ ਨੂੰ IST ਵਿੱਚ ਬਦਲੋ
-                last_time = datetime.fromtimestamp(timestamps[-1], timezone.utc) + timedelta(hours=5, minutes=30)
+            if not df.empty:
+                last_ts = data['data'][-1][0] # ਟਾਈਮਸਟੈਂਪ (ਮਿਲੀਸਕਿੰਟ ਵਿੱਚ)
+                last_time = datetime.fromtimestamp(last_ts / 1000, timezone.utc) + timedelta(hours=5, minutes=30)
                 last_time_str = last_time.strftime("%H:%M")
-            
-            df = pd.DataFrame({
-                'open': q['open'], 'high': q['high'], 'low': q['low'], 'close': q['close']
-            }).dropna()
-            
-            return df, last_time_str
-    except Exception:
-        return None, None
+                
+            return df[['open', 'high', 'low', 'close']], last_time_str
+    except Exception as e:
+        print(f"Angel API Error ({token}): {e}", flush=True)
+    return None, None
 
 # ==================== ਇੰਡੀਕੇਟਰਜ਼ ====================
 def add_indicators(df):
@@ -219,19 +222,14 @@ def check_active_trades(trades, angel):
 def main():
     if not is_market_open(): return
 
-    vix_df, _ = fetch_yahoo("^INDIAVIX", "1d")
-    if vix_df is None or vix_df.empty: return
-    vix = vix_df['close'].iloc[-1]
-    
-    if vix < 10.0 or vix > 28.0:
-        print(f"VIX ({vix:.2f}) ਖਤਰਨਾਕ ਹੈ।", flush=True)
-        return
-
     angel = SmartConnect(api_key=API_KEY)
     try:
         totp = pyotp.TOTP(TOTP_SECRET).now()
         if not angel.generateSession(CLIENT_ID, PASSWORD, totp)['status']: return
-    except: return
+        print("Angel One ਲੌਗਇਨ ਸਫਲ!", flush=True)
+    except Exception as e:
+        print(f"Angel One ਲੌਗਇਨ ਫੇਲ: {e}", flush=True)
+        return
 
     file_path = "instruments.json"
     if not os.path.exists(file_path):
@@ -248,10 +246,13 @@ def main():
     current_time_str = get_ist_time().strftime("%H:%M")
 
     for name, info in INDEX_TOKENS.items():
-        df_15, time_15 = fetch_yahoo(info["yahoo"], "15m")
-        df_5, time_5 = fetch_yahoo(info["yahoo"], "5m")
+        # Angel One ਤੋਂ 15-ਮਿੰਟ ਅਤੇ 5-ਮਿੰਟ ਦਾ ਡੇਟਾ ਲਵੋ
+        df_15, time_15 = fetch_angel_candles(angel, info["token"], info["index_exch"], "FIFTEEN_MINUTE")
+        df_5, time_5 = fetch_angel_candles(angel, info["token"], info["index_exch"], "FIVE_MINUTE")
         
-        if df_15 is None or df_5 is None or len(df_5) < 30: continue
+        if df_15 is None or df_5 is None or len(df_5) < 30: 
+            print(f"-> {name}: ਡੇਟਾ ਨਹੀਂ ਮਿਲਿਆ।", flush=True)
+            continue
         
         df_15 = add_indicators(df_15)
         df_5 = add_indicators(df_5)
@@ -323,7 +324,6 @@ def main():
             elif c5["rsi"] <= 48: search_type = "PE (Put)"
             else: search_type = "Neutral"
             
-            # ਲੌਗ ਵਿੱਚ ਵੀ ਡੇਟਾ ਸਮਾਂ ਦਿਖਾਓ
             print(f"-> {name}: {search_type} ਲੱਭ ਰਹੇ ਹਾਂ... (ਡੇਟਾ: {time_5} ਵਜੇ ਦਾ | RSI: {c5['rsi']:.1f}, ADX: {c5['adx']:.1f})", flush=True)
 
     save_trades(trades)
