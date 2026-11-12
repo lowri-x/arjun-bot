@@ -20,6 +20,7 @@ CHAT_ID = os.environ.get("CHAT_ID")
 GIST_ID = os.environ.get("GIST_ID")
 GIST_TOKEN = os.environ.get("GIST_TOKEN")
 
+# ਸਿਰਫ਼ Nifty ਅਤੇ Bank Nifty
 INDEX_TOKENS = {
     "NIFTY 50": {"token": "99926000", "symbol": "NIFTY", "exch": "NFO", "index_exch": "NSE", "step": 50, "default_lot": 25},
     "BANK NIFTY": {"token": "99926009", "symbol": "BANKNIFTY", "exch": "NFO", "index_exch": "NSE", "step": 100, "default_lot": 15}
@@ -44,20 +45,20 @@ def send_telegram(text):
     try: urllib.request.urlopen(req, context=ctx, timeout=10)
     except Exception as e: print(f"Telegram Error: {e}", flush=True)
 
-# ==================== GIST ਹੈਂਡਲਿੰਗ (ਐਰਰ ਸਟੇਟਸ ਸਮੇਤ) ====================
+# ==================== GIST ਹੈਂਡਲਿੰਗ ====================
 def load_trades():
-    default_state = {"active": [], "history": [], "last_start_msg": "", "last_end_msg": "", "last_error_date": ""}
-    if not GIST_ID or not GIST_TOKEN: return default_state
+    if not GIST_ID or not GIST_TOKEN: return {"active": [], "history": [], "last_start_msg": "", "last_end_msg": ""}
     headers = {"Authorization": f"token {GIST_TOKEN}"}
     try:
         res = requests.get(f"https://api.github.com/gists/{GIST_ID}", headers=headers)
         if res.status_code == 200:
             content = json.loads(res.json()['files']['trades.json']['content'])
-            for key in default_state:
-                if key not in content: content[key] = default_state[key]
+            # ਪੁਰਾਣੀ ਫਾਈਲ ਵਿੱਚ ਨਵੀਆਂ ਕੀਜ਼ ਐਡ ਕਰੋ ਜੇ ਨਾ ਹੋਣ
+            if "last_start_msg" not in content: content["last_start_msg"] = ""
+            if "last_end_msg" not in content: content["last_end_msg"] = ""
             return content
     except: pass
-    return default_state
+    return {"active": [], "history": [], "last_start_msg": "", "last_end_msg": ""}
 
 def save_trades(trades):
     if not GIST_ID or not GIST_TOKEN: return
@@ -66,19 +67,7 @@ def save_trades(trades):
     try: requests.patch(f"https://api.github.com/gists/{GIST_ID}", headers=headers, json=payload)
     except: pass
 
-def report_critical_error(error_msg, trades):
-    """ਜੇਕਰ ਕੋਈ ਵੱਡੀ ਸਮੱਸਿਆ ਆਵੇ ਤਾਂ ਇੱਕ ਵਾਰ ਟੈਲੀਗਰਾਮ 'ਤੇ ਮੈਸੇਜ ਭੇਜੋ"""
-    today_str = get_ist_time().strftime("%Y-%m-%d")
-    if trades.get("last_error_date") != today_str:
-        msg = f"🚨 <b>LowriX ਬੋਟ ਵਿੱਚ ਸਮੱਸਿਆ ਆਈ ਹੈ!</b>\n\n"
-        msg += f"ਬੋਟ ਆਪਣੇ ਆਪ ਠੀਕ ਨਹੀਂ ਹੋ ਸਕਿਆ। ਕਿਰਪਾ ਕਰਕੇ ਚੈੱਕ ਕਰੋ:\n"
-        msg += f"<code>{error_msg}</code>\n\n"
-        msg += f"⏰ ਸਮਾਂ: {get_ist_time().strftime('%H:%M')}"
-        send_telegram(msg)
-        trades["last_error_date"] = today_str
-        save_trades(trades)
-
-# ==================== ਡੇਟਾ ਫੈਚਿੰਗ (Auto-Retry ਨਾਲ) ====================
+# ==================== ਡੇਟਾ ਫੈਚਿੰਗ (Angel One ਤੋਂ) ====================
 def fetch_angel_candles(angel, token, exch, interval):
     now_ist = get_ist_time()
     from_date = (now_ist - timedelta(days=5)).strftime("%Y-%m-%d %H:%M")
@@ -111,18 +100,16 @@ def fetch_angel_candles(angel, token, exch, interval):
                         
                 return df[['open', 'high', 'low', 'close']], last_time_str
             else:
-                # ਜੇਕਰ API ਨੇ ਬਲਾਕ ਕੀਤਾ ਹੈ, ਤਾਂ 5 ਸਕਿੰਟ ਰੁਕ ਕੇ ਦੁਬਾਰਾ ਕੋਸ਼ਿਸ਼ ਕਰੋ
                 if attempt < 2: 
-                    print(f"API ਬਲਾਕ, 5 ਸਕਿੰਟ ਬਾਅਦ ਦੁਬਾਰਾ ਕੋਸ਼ਿਸ਼...", flush=True)
                     time.sleep(5) 
                     continue
                 return None, None
-        except Exception as e:
+        except Exception:
             if attempt == 2: return None, None
             time.sleep(3)
     return None, None
 
-# ==================== ਇੰਡੀਕੇਟਰਜ਼ (ਸਖ਼ਤ ਸ਼ਰਤਾਂ ਵਾਪਸ) ====================
+# ==================== ਇੰਡੀਕੇਟਰਜ਼ ====================
 def add_indicators(df):
     df = df.copy()
     close, high, low, open_ = df["close"], df["high"], df["low"], df["open"]
@@ -249,22 +236,34 @@ def check_active_trades(trades, angel):
 
 # ==================== ਮੁੱਖ ਲੂਪ ====================
 def main():
-    if not is_market_open(): return
-
     trades = load_trades()
     now = get_ist_time()
     today_str = now.strftime("%Y-%m-%d")
     current_time_str = now.strftime("%H:%M")
 
+    # 1. ਜੇਕਰ ਮਾਰਕੀਟ ਬੰਦ ਹੈ
+    if not is_market_open():
+        print("ਮਾਰਕੀਟ ਬੰਦ ਹੈ।", flush=True)
+        # ਜੇਕਰ ਸਮਾਂ 3:30 ਤੋਂ ਬਾਅਦ ਦਾ ਹੈ, ਤਾਂ ਇੱਕ ਵਾਰ ਬੰਦ ਹੋਣ ਦਾ ਮੈਸੇਜ ਭੇਜੋ
+        if now.hour >= 15 and trades.get("last_end_msg") != today_str:
+            send_telegram(f"🔴 <b>LowriX ਬੋਟ ਦਾ ਕੰਮ ਪੂਰਾ ਹੋਇਆ</b>\nਮਾਰਕੀਟ ਬੰਦ ਹੋ ਗਈ ਹੈ।\n⏰ ਸਮਾਂ: {current_time_str}")
+            trades["last_end_msg"] = today_str
+            save_trades(trades)
+        return
+
+    # 2. ਸਵੇਰ ਦਾ ਮੈਸੇਜ
+    if trades.get("last_start_msg") != today_str:
+        send_telegram(f"✅ <b>LowriX ਬੋਟ ਚਾਲੂ ਹੋ ਗਿਆ ਹੈ!</b>\nਮਾਰਕੀਟ ਖੁੱਲ੍ਹ ਗਈ ਹੈ।\n⏰ ਸਮਾਂ: {current_time_str}")
+        trades["last_start_msg"] = today_str
+        save_trades(trades)
+
     try:
-        # 1. Angel One ਲੌਗਇਨ
         angel = SmartConnect(api_key=API_KEY)
         totp = pyotp.TOTP(TOTP_SECRET).now()
         session_data = angel.generateSession(CLIENT_ID, PASSWORD, totp)
         if not session_data['status']:
             raise Exception("Angel One ਲੌਗਇਨ ਫੇਲ (Invalid TOTP/MPIN)")
 
-        # 2. ਇੰਸਟਰੂਮੈਂਟ ਫਾਈਲ
         file_path = "instruments.json"
         if not os.path.exists(file_path):
             url = "https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json"
@@ -276,22 +275,8 @@ def main():
         with open(file_path, 'r') as f:
             instrument_df = pd.DataFrame(json.load(f))
 
-        # 3. ਸਵੇਰ ਅਤੇ ਸ਼ਾਮ ਦੇ ਮੈਸੇਜ
-        if trades.get("last_start_msg") != today_str:
-            send_telegram(f"✅ <b>LowriX ਬੋਟ ਚਾਲੂ ਹੋ ਗਿਆ ਹੈ!</b>\nਮਾਰਕੀਟ ਖੁੱਲ੍ਹ ਗਈ ਹੈ।\n⏰ ਸਮਾਂ: {current_time_str}")
-            trades["last_start_msg"] = today_str
-            save_trades(trades)
-
-        if now.hour == 15 and now.minute >= 25 and trades.get("last_end_msg") != today_str:
-            send_telegram(f"🔴 <b>LowriX ਬੋਟ ਦਾ ਕੰਮ ਪੂਰਾ ਹੋਇਆ</b>\nਮਾਰਕੀਟ ਬੰਦ ਹੋ ਰਹੀ ਹੈ।\n⏰ ਸਮਾਂ: {current_time_str}")
-            trades["last_end_msg"] = today_str
-            save_trades(trades)
-            return
-
-        # 4. ਚੱਲ ਰਹੇ ਟ੍ਰੇਡ ਚੈੱਕ ਕਰੋ
         trades = check_active_trades(trades, angel)
 
-        # 5. ਸਕੈਨਿੰਗ
         for name, info in INDEX_TOKENS.items():
             df_15, time_15 = fetch_angel_candles(angel, info["token"], info["index_exch"], "FIFTEEN_MINUTE")
             df_5, time_5 = fetch_angel_candles(angel, info["token"], info["index_exch"], "FIVE_MINUTE")
@@ -305,7 +290,6 @@ def main():
             
             c5, p5, c15 = df_5.iloc[-1], df_5.iloc[-2], df_15.iloc[-1]
             
-            # ਸਖ਼ਤ ਸ਼ਰਤਾਂ (Strict Conditions)
             htf_bull = (c15["close"] > c15["ema21"]) and (c15["st_dir"] == 1)
             htf_bear = (c15["close"] < c15["ema21"]) and (c15["st_dir"] == -1)
             
@@ -369,9 +353,11 @@ def main():
         save_trades(trades)
 
     except Exception as e:
-        # ਜੇਕਰ ਉੱਪਰ ਦੱਸਿਆ ਕੋਈ ਵੀ ਕੰਮ ਫੇਲ ਹੋਵੇ, ਤਾਂ ਇਹ ਬਲਾਕ ਚੱਲੇਗਾ
         print(f"CRITICAL ERROR: {e}", flush=True)
-        report_critical_error(str(e), trades)
+        if trades.get("last_error_date") != today_str:
+            send_telegram(f"🚨 <b>LowriX ਬੋਟ ਵਿੱਚ ਸਮੱਸਿਆ ਆਈ ਹੈ!</b>\n\n<code>{str(e)}</code>\n\nਕਿਰਪਾ ਕਰਕੇ ਚੈੱਕ ਕਰੋ।")
+            trades["last_error_date"] = today_str
+            save_trades(trades)
 
 if __name__ == "__main__":
     main()
