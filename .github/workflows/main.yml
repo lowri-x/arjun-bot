@@ -25,4 +25,4 @@ jobs:
           CHAT_ID: ${{ secrets.CHAT_ID }}
           GIST_ID: ${{ secrets.GIST_ID }}
           GIST_TOKEN: ${{ secrets.GIST_TOKEN }}
-        run: python arjun_cloud.py
+        run: python -u arjun_cloud.py
