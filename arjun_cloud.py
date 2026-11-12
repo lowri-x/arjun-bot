@@ -20,7 +20,6 @@ CHAT_ID = os.environ.get("CHAT_ID")
 GIST_ID = os.environ.get("GIST_ID")
 GIST_TOKEN = os.environ.get("GIST_TOKEN")
 
-# ਸਿਰਫ਼ Nifty ਅਤੇ Bank Nifty
 INDEX_TOKENS = {
     "NIFTY 50": {"token": "99926000", "symbol": "NIFTY", "exch": "NFO", "index_exch": "NSE", "step": 50, "default_lot": 25},
     "BANK NIFTY": {"token": "99926009", "symbol": "BANKNIFTY", "exch": "NFO", "index_exch": "NSE", "step": 100, "default_lot": 15}
@@ -45,19 +44,20 @@ def send_telegram(text):
     try: urllib.request.urlopen(req, context=ctx, timeout=10)
     except Exception as e: print(f"Telegram Error: {e}", flush=True)
 
-# ==================== GIST ਹੈਂਡਲਿੰਗ ====================
+# ==================== GIST ਹੈਂਡਲਿੰਗ (ਐਰਰ ਸਟੇਟਸ ਸਮੇਤ) ====================
 def load_trades():
-    if not GIST_ID or not GIST_TOKEN: return {"active": [], "history": [], "last_start_msg": "", "last_end_msg": ""}
+    default_state = {"active": [], "history": [], "last_start_msg": "", "last_end_msg": "", "last_error_date": ""}
+    if not GIST_ID or not GIST_TOKEN: return default_state
     headers = {"Authorization": f"token {GIST_TOKEN}"}
     try:
         res = requests.get(f"https://api.github.com/gists/{GIST_ID}", headers=headers)
         if res.status_code == 200:
             content = json.loads(res.json()['files']['trades.json']['content'])
-            if "last_start_msg" not in content: content["last_start_msg"] = ""
-            if "last_end_msg" not in content: content["last_end_msg"] = ""
+            for key in default_state:
+                if key not in content: content[key] = default_state[key]
             return content
     except: pass
-    return {"active": [], "history": [], "last_start_msg": "", "last_end_msg": ""}
+    return default_state
 
 def save_trades(trades):
     if not GIST_ID or not GIST_TOKEN: return
@@ -66,49 +66,63 @@ def save_trades(trades):
     try: requests.patch(f"https://api.github.com/gists/{GIST_ID}", headers=headers, json=payload)
     except: pass
 
-# ==================== ਡੇਟਾ ਫੈਚਿੰਗ (Angel One ਤੋਂ) ====================
+def report_critical_error(error_msg, trades):
+    """ਜੇਕਰ ਕੋਈ ਵੱਡੀ ਸਮੱਸਿਆ ਆਵੇ ਤਾਂ ਇੱਕ ਵਾਰ ਟੈਲੀਗਰਾਮ 'ਤੇ ਮੈਸੇਜ ਭੇਜੋ"""
+    today_str = get_ist_time().strftime("%Y-%m-%d")
+    if trades.get("last_error_date") != today_str:
+        msg = f"🚨 <b>LowriX ਬੋਟ ਵਿੱਚ ਸਮੱਸਿਆ ਆਈ ਹੈ!</b>\n\n"
+        msg += f"ਬੋਟ ਆਪਣੇ ਆਪ ਠੀਕ ਨਹੀਂ ਹੋ ਸਕਿਆ। ਕਿਰਪਾ ਕਰਕੇ ਚੈੱਕ ਕਰੋ:\n"
+        msg += f"<code>{error_msg}</code>\n\n"
+        msg += f"⏰ ਸਮਾਂ: {get_ist_time().strftime('%H:%M')}"
+        send_telegram(msg)
+        trades["last_error_date"] = today_str
+        save_trades(trades)
+
+# ==================== ਡੇਟਾ ਫੈਚਿੰਗ (Auto-Retry ਨਾਲ) ====================
 def fetch_angel_candles(angel, token, exch, interval):
     now_ist = get_ist_time()
     from_date = (now_ist - timedelta(days=5)).strftime("%Y-%m-%d %H:%M")
     to_date = now_ist.strftime("%Y-%m-%d %H:%M")
     
-    try:
-        # API ਦੀ ਰੇਟ ਲਿਮਿਟ ਤੋਂ ਬਚਣ ਲਈ 2 ਸਕਿੰਟ ਦਾ ਸਮਾਂ
-        time.sleep(2.0) 
-        data = angel.getCandleData({
-            "exchange": exch, "symboltoken": token, "interval": interval,
-            "fromdate": from_date, "todate": to_date
-        })
-        
-        if data and isinstance(data, dict) and data.get('status') == True and isinstance(data.get('data'), list) and len(data['data']) > 0:
-            df = pd.DataFrame(data['data'], columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+    for attempt in range(3): # 3 ਵਾਰ ਕੋਸ਼ਿਸ਼ ਕਰੇਗਾ
+        try:
+            time.sleep(2.5) # API ਲਿਮਿਟ ਤੋਂ ਬਚਣ ਲਈ
+            data = angel.getCandleData({
+                "exchange": exch, "symboltoken": token, "interval": interval,
+                "fromdate": from_date, "todate": to_date
+            })
             
-            numeric_cols = ['open', 'high', 'low', 'close']
-            df[numeric_cols] = df[numeric_cols].apply(pd.to_numeric, errors='coerce')
-            df = df.dropna(subset=numeric_cols)
-            
-            last_time_str = "Unknown"
-            if not df.empty:
-                last_ts = data['data'][-1][0]
-                try:
-                    if isinstance(last_ts, (int, float)):
-                        last_time = datetime.fromtimestamp(last_ts / 1000, timezone.utc) + timedelta(hours=5, minutes=30)
-                    else:
-                        last_time = pd.to_datetime(last_ts).tz_convert('Asia/Kolkata')
-                    last_time_str = last_time.strftime("%H:%M")
-                except: pass
-                    
-            return df[['open', 'high', 'low', 'close']], last_time_str
-        else:
-            # ਜੇਕਰ API ਬਲਾਕ ਹੈ, ਤਾਂ ਸਿੱਧਾ ਬਾਹਰ ਨਿਕਲ ਜਾਓ (ਅਗਲੇ 5 ਮਿੰਟ ਵਾਲੇ ਰਨ ਦੀ ਉਡੀਕ ਕਰੋ)
-            print(f"API Error ({token}): Rate limit hit. Skipping to next cycle.", flush=True)
-            return None, None
-            
-    except Exception as e:
-        print(f"API Exception ({token}): {e}", flush=True)
-        return None, None
+            if data and isinstance(data, dict) and data.get('status') == True and isinstance(data.get('data'), list) and len(data['data']) > 0:
+                df = pd.DataFrame(data['data'], columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+                numeric_cols = ['open', 'high', 'low', 'close']
+                df[numeric_cols] = df[numeric_cols].apply(pd.to_numeric, errors='coerce')
+                df = df.dropna(subset=numeric_cols)
+                
+                last_time_str = "Unknown"
+                if not df.empty:
+                    last_ts = data['data'][-1][0]
+                    try:
+                        if isinstance(last_ts, (int, float)):
+                            last_time = datetime.fromtimestamp(last_ts / 1000, timezone.utc) + timedelta(hours=5, minutes=30)
+                        else:
+                            last_time = pd.to_datetime(last_ts).tz_convert('Asia/Kolkata')
+                        last_time_str = last_time.strftime("%H:%M")
+                    except: pass
+                        
+                return df[['open', 'high', 'low', 'close']], last_time_str
+            else:
+                # ਜੇਕਰ API ਨੇ ਬਲਾਕ ਕੀਤਾ ਹੈ, ਤਾਂ 5 ਸਕਿੰਟ ਰੁਕ ਕੇ ਦੁਬਾਰਾ ਕੋਸ਼ਿਸ਼ ਕਰੋ
+                if attempt < 2: 
+                    print(f"API ਬਲਾਕ, 5 ਸਕਿੰਟ ਬਾਅਦ ਦੁਬਾਰਾ ਕੋਸ਼ਿਸ਼...", flush=True)
+                    time.sleep(5) 
+                    continue
+                return None, None
+        except Exception as e:
+            if attempt == 2: return None, None
+            time.sleep(3)
+    return None, None
 
-# ==================== ਇੰਡੀਕੇਟਰਜ਼ ====================
+# ==================== ਇੰਡੀਕੇਟਰਜ਼ (ਸਖ਼ਤ ਸ਼ਰਤਾਂ ਵਾਪਸ) ====================
 def add_indicators(df):
     df = df.copy()
     close, high, low, open_ = df["close"], df["high"], df["low"], df["open"]
@@ -237,131 +251,127 @@ def check_active_trades(trades, angel):
 def main():
     if not is_market_open(): return
 
-    angel = SmartConnect(api_key=API_KEY)
-    try:
-        totp = pyotp.TOTP(TOTP_SECRET).now()
-        if not angel.generateSession(CLIENT_ID, PASSWORD, totp)['status']: return
-        print("Angel One ਲੌਗਇਨ ਸਫਲ!", flush=True)
-    except Exception as e:
-        print(f"Angel One ਲੌਗਇਨ ਫੇਲ: {e}", flush=True)
-        return
-
-    file_path = "instruments.json"
-    if not os.path.exists(file_path):
-        url = "https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json"
-        response = requests.get(url)
-        with open(file_path, 'wb') as f: f.write(response.content)
-            
-    with open(file_path, 'r') as f:
-        instrument_df = pd.DataFrame(json.load(f))
-
     trades = load_trades()
-    
-    # ==================== ਸਵੇਰ ਅਤੇ ਸ਼ਾਮ ਦੇ ਟੈਸਟ ਮੈਸੇਜ ====================
     now = get_ist_time()
     today_str = now.strftime("%Y-%m-%d")
     current_time_str = now.strftime("%H:%M")
 
-    if trades.get("last_start_msg") != today_str:
-        msg = f"✅ <b>LowriX ਬੋਟ ਚਾਲੂ ਹੋ ਗਿਆ ਹੈ!</b>\n\nਮਾਰਕੀਟ ਖੁੱਲ੍ਹ ਗਈ ਹੈ। ਬੋਟ ਹੁਣ ਲਾਈਵ ਡੇਟਾ ਸਕੈਨ ਕਰ ਰਿਹਾ ਹੈ।\n⏰ ਸਮਾਂ: {current_time_str}"
-        send_telegram(msg)
-        trades["last_start_msg"] = today_str
-        save_trades(trades)
-        print("ਸਵੇਰ ਦਾ ਮੈਸੇਜ ਭੇਜ ਦਿੱਤਾ ਗਿਆ।", flush=True)
+    try:
+        # 1. Angel One ਲੌਗਇਨ
+        angel = SmartConnect(api_key=API_KEY)
+        totp = pyotp.TOTP(TOTP_SECRET).now()
+        session_data = angel.generateSession(CLIENT_ID, PASSWORD, totp)
+        if not session_data['status']:
+            raise Exception("Angel One ਲੌਗਇਨ ਫੇਲ (Invalid TOTP/MPIN)")
 
-    if now.hour == 15 and now.minute >= 25 and trades.get("last_end_msg") != today_str:
-        msg = f"🔴 <b>LowriX ਬੋਟ ਦਾ ਕੰਮ ਪੂਰਾ ਹੋਇਆ</b>\n\nਮਾਰਕੀਟ ਬੰਦ ਹੋ ਰਹੀ ਹੈ।\n⏰ ਸਮਾਂ: {current_time_str}"
-        send_telegram(msg)
-        trades["last_end_msg"] = today_str
-        save_trades(trades)
-        print("ਸ਼ਾਮ ਦਾ ਮੈਸੇਜ ਭੇਜ ਦਿੱਤਾ ਗਿਆ।", flush=True)
-        return
+        # 2. ਇੰਸਟਰੂਮੈਂਟ ਫਾਈਲ
+        file_path = "instruments.json"
+        if not os.path.exists(file_path):
+            url = "https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json"
+            response = requests.get(url, timeout=20)
+            if response.status_code != 200:
+                raise Exception("Instrument Master ਡਾਊਨਲੋਡ ਫੇਲ")
+            with open(file_path, 'wb') as f: f.write(response.content)
+                
+        with open(file_path, 'r') as f:
+            instrument_df = pd.DataFrame(json.load(f))
 
-    # ==================== ਸਕੈਨਿੰਗ ਸ਼ੁਰੂ ====================
-    trades = check_active_trades(trades, angel)
+        # 3. ਸਵੇਰ ਅਤੇ ਸ਼ਾਮ ਦੇ ਮੈਸੇਜ
+        if trades.get("last_start_msg") != today_str:
+            send_telegram(f"✅ <b>LowriX ਬੋਟ ਚਾਲੂ ਹੋ ਗਿਆ ਹੈ!</b>\nਮਾਰਕੀਟ ਖੁੱਲ੍ਹ ਗਈ ਹੈ।\n⏰ ਸਮਾਂ: {current_time_str}")
+            trades["last_start_msg"] = today_str
+            save_trades(trades)
 
-    for name, info in INDEX_TOKENS.items():
-        print(f"-> {name} ਲਈ ਡੇਟਾ ਲੈ ਰਹੇ ਹਾਂ...", flush=True)
-        
-        df_15, time_15 = fetch_angel_candles(angel, info["token"], info["index_exch"], "FIFTEEN_MINUTE")
-        df_5, time_5 = fetch_angel_candles(angel, info["token"], info["index_exch"], "FIVE_MINUTE")
-        
-        if df_15 is None or df_5 is None or len(df_5) < 30: 
-            print(f"-> {name}: ਡੇਟਾ ਨਹੀਂ ਮਿਲਿਆ।", flush=True)
-            continue
-        
-        df_15 = add_indicators(df_15)
-        df_5 = add_indicators(df_5)
-        
-        c5, p5, c15 = df_5.iloc[-1], df_5.iloc[-2], df_15.iloc[-1]
-        
-        htf_bull = (c15["close"] > c15["ema21"]) and (c15["st_dir"] == 1)
-        htf_bear = (c15["close"] < c15["ema21"]) and (c15["st_dir"] == -1)
-        
-        adx_expanding = (c5["adx"] > 14.0) and (c5["adx"] > p5["adx"])
-        bull_candle = bool(c5["pat_bull_engulf"] or c5["pat_hammer"] or (c5["close"] > p5["high"]))
-        bear_candle = bool(c5["pat_bear_engulf"] or c5["pat_shooting_star"] or (c5["close"] < p5["low"]))
+        if now.hour == 15 and now.minute >= 25 and trades.get("last_end_msg") != today_str:
+            send_telegram(f"🔴 <b>LowriX ਬੋਟ ਦਾ ਕੰਮ ਪੂਰਾ ਹੋਇਆ</b>\nਮਾਰਕੀਟ ਬੰਦ ਹੋ ਰਹੀ ਹੈ।\n⏰ ਸਮਾਂ: {current_time_str}")
+            trades["last_end_msg"] = today_str
+            save_trades(trades)
+            return
 
-        new_signal = None
-        
-        if htf_bull and (c5["ema9"] > c5["ema21"]) and (52 <= c5["rsi"] <= 75) and adx_expanding and (c5["plus_di"] > c5["minus_di"]) and bull_candle:
-            new_signal = "CE"
-        elif htf_bear and (c5["ema9"] < c5["ema21"]) and (25 <= c5["rsi"] <= 48) and adx_expanding and (c5["minus_di"] > c5["plus_di"]) and bear_candle:
-            new_signal = "PE"
+        # 4. ਚੱਲ ਰਹੇ ਟ੍ਰੇਡ ਚੈੱਕ ਕਰੋ
+        trades = check_active_trades(trades, angel)
 
-        if new_signal and not any(t["name"] == name for t in trades["active"]):
-            step = info["step"]
-            strike = round((c5['close'] + step) / step) * step if new_signal == "CE" else round((c5['close'] - step) / step) * step
+        # 5. ਸਕੈਨਿੰਗ
+        for name, info in INDEX_TOKENS.items():
+            df_15, time_15 = fetch_angel_candles(angel, info["token"], info["index_exch"], "FIFTEEN_MINUTE")
+            df_5, time_5 = fetch_angel_candles(angel, info["token"], info["index_exch"], "FIVE_MINUTE")
             
-            opt_token, opt_symbol, exch, lot_size = find_option_token(name, strike, new_signal, instrument_df)
+            if df_15 is None or df_5 is None or len(df_5) < 30: 
+                print(f"-> {name}: ਡੇਟਾ ਨਹੀਂ ਮਿਲਿਆ।", flush=True)
+                continue
             
-            if opt_token and lot_size > 0:
-                entry_premium = get_option_ltp(angel, opt_token, exch)
-                if entry_premium > 0:
-                    atr_risk = 1.5 * c15["atr"] * 0.5
-                    sl_distance = min(atr_risk, entry_premium * 0.25)
-                    
-                    sl_premium = entry_premium - sl_distance if new_signal == "CE" else entry_premium + sl_distance
-                    target_premium = entry_premium + (1.5 * sl_distance) if new_signal == "CE" else entry_premium - (1.5 * sl_distance)
+            df_15 = add_indicators(df_15)
+            df_5 = add_indicators(df_5)
+            
+            c5, p5, c15 = df_5.iloc[-1], df_5.iloc[-2], df_15.iloc[-1]
+            
+            # ਸਖ਼ਤ ਸ਼ਰਤਾਂ (Strict Conditions)
+            htf_bull = (c15["close"] > c15["ema21"]) and (c15["st_dir"] == 1)
+            htf_bear = (c15["close"] < c15["ema21"]) and (c15["st_dir"] == -1)
+            
+            adx_expanding = (c5["adx"] > 14.0) and (c5["adx"] > p5["adx"])
+            bull_candle = bool(c5["pat_bull_engulf"] or c5["pat_hammer"] or (c5["close"] > p5["high"]))
+            bear_candle = bool(c5["pat_bear_engulf"] or c5["pat_shooting_star"] or (c5["close"] < p5["low"]))
 
-                    risk_per_lot = sl_distance * lot_size
-                    
-                    if risk_per_lot <= 300: risk_status = "✅ ਘੱਟ ਰਿਸਕ"
-                    elif risk_per_lot <= 600: risk_status = "⚠️ ਦਰਮਿਆਨਾ ਰਿਸਕ"
-                    else: risk_status = "🚨 ਵੱਧ ਰਿਸਕ"
-                    
-                    trade = {
-                        "name": name, "type": new_signal, "symbol": opt_symbol,
-                        "opt_token": opt_token, "exch": exch,
-                        "entry_premium": entry_premium, "sl_premium": sl_premium, 
-                        "target_premium": target_premium, "qty": lot_size,
-                        "time": get_ist_time().strftime("%Y-%m-%d %H:%M")
-                    }
-                    trades["active"].append(trade)
-                    
-                    msg = f"🚀 <b>ਨਵਾਂ {new_signal} ਸਿਗਨਲ (MTF)</b>\n\n"
-                    msg += f"⏰ <b>ਡੇਟਾ ਸਮਾਂ:</b> {time_5} ਵਜੇ ਦਾ (5m)\n"
-                    msg += f"⏰ <b>ਅਲਰਟ ਸਮਾਂ:</b> {current_time_str} ਵਜੇ\n\n"
-                    msg += f"📊 {name} (₹{c5['close']:.2f})\n"
-                    msg += f"🎯 {opt_symbol}\n"
-                    msg += f"💰 Entry: ₹{entry_premium:.2f}\n"
-                    msg += f"🛑 SL: ₹{sl_premium:.2f}\n"
-                    msg += f"🎯 Target (1.5R): ₹{target_premium:.2f}\n"
-                    msg += f"📦 Qty: {lot_size} (1 Lot)\n"
-                    msg += f"💵 <b>Total Risk: ₹{risk_per_lot:.2f}</b>\n"
-                    msg += f"ℹ️ ਸਥਿਤੀ: {risk_status}"
-                    send_telegram(msg)
-                    print(f"-> {name}: ✅ ਸਿਗਨਲ ਮਿਲਿਆ - {new_signal} (Data: {time_5})", flush=True)
+            new_signal = None
+            
+            if htf_bull and (c5["ema9"] > c5["ema21"]) and (52 <= c5["rsi"] <= 75) and adx_expanding and (c5["plus_di"] > c5["minus_di"]) and bull_candle:
+                new_signal = "CE"
+            elif htf_bear and (c5["ema9"] < c5["ema21"]) and (25 <= c5["rsi"] <= 48) and adx_expanding and (c5["minus_di"] > c5["plus_di"]) and bear_candle:
+                new_signal = "PE"
+
+            if new_signal and not any(t["name"] == name for t in trades["active"]):
+                step = info["step"]
+                strike = round((c5['close'] + step) / step) * step if new_signal == "CE" else round((c5['close'] - step) / step) * step
+                
+                opt_token, opt_symbol, exch, lot_size = find_option_token(name, strike, new_signal, instrument_df)
+                
+                if opt_token and lot_size > 0:
+                    entry_premium = get_option_ltp(angel, opt_token, exch)
+                    if entry_premium > 0:
+                        atr_risk = 1.5 * c15["atr"] * 0.5
+                        sl_distance = min(atr_risk, entry_premium * 0.25)
+                        
+                        sl_premium = entry_premium - sl_distance if new_signal == "CE" else entry_premium + sl_distance
+                        target_premium = entry_premium + (1.5 * sl_distance) if new_signal == "CE" else entry_premium - (1.5 * sl_distance)
+
+                        risk_per_lot = sl_distance * lot_size
+                        
+                        if risk_per_lot <= 300: risk_status = "✅ ਘੱਟ ਰਿਸਕ"
+                        elif risk_per_lot <= 600: risk_status = "⚠️ ਦਰਮਿਆਨਾ ਰਿਸਕ"
+                        else: risk_status = "🚨 ਵੱਧ ਰਿਸਕ"
+                        
+                        trade = {
+                            "name": name, "type": new_signal, "symbol": opt_symbol,
+                            "opt_token": opt_token, "exch": exch,
+                            "entry_premium": entry_premium, "sl_premium": sl_premium, 
+                            "target_premium": target_premium, "qty": lot_size,
+                            "time": get_ist_time().strftime("%Y-%m-%d %H:%M")
+                        }
+                        trades["active"].append(trade)
+                        
+                        msg = f"🚀 <b>ਨਵਾਂ {new_signal} ਸਿਗਨਲ (Strict)</b>\n\n"
+                        msg += f"⏰ <b>ਡੇਟਾ ਸਮਾਂ:</b> {time_5} ਵਜੇ ਦਾ\n"
+                        msg += f"📊 {name} (₹{c5['close']:.2f})\n"
+                        msg += f"🎯 {opt_symbol}\n"
+                        msg += f"💰 Entry: ₹{entry_premium:.2f}\n"
+                        msg += f"🛑 SL: ₹{sl_premium:.2f}\n"
+                        msg += f"🎯 Target: ₹{target_premium:.2f}\n"
+                        msg += f"📦 Qty: {lot_size} (1 Lot)\n"
+                        msg += f"💵 <b>Total Risk: ₹{risk_per_lot:.2f}</b>\n"
+                        msg += f"ℹ️ ਸਥਿਤੀ: {risk_status}"
+                        send_telegram(msg)
+                else:
+                    print(f"-> {name}: ਸਟ੍ਰਾਈਕ {strike} ਨਹੀਂ ਮਿਲਿਆ।", flush=True)
             else:
-                print(f"-> {name}: ਸਟ੍ਰਾਈਕ {strike} ਨਹੀਂ ਮਿਲਿਆ।", flush=True)
-        else:
-            if c5["rsi"] >= 52: search_type = "CE (Call)"
-            elif c5["rsi"] <= 48: search_type = "PE (Put)"
-            else: search_type = "Neutral"
-            
-            print(f"-> {name}: {search_type} ਲੱਭ ਰਹੇ ਹਾਂ... (ਡੇਟਾ: {time_5} ਵਜੇ ਦਾ | RSI: {c5['rsi']:.1f}, ADX: {c5['adx']:.1f})", flush=True)
+                print(f"-> {name}: ਕੋਈ ਸਿਗਨਲ ਨਹੀਂ (RSI: {c5['rsi']:.1f}, ADX: {c5['adx']:.1f})", flush=True)
 
-    save_trades(trades)
+        save_trades(trades)
+
+    except Exception as e:
+        # ਜੇਕਰ ਉੱਪਰ ਦੱਸਿਆ ਕੋਈ ਵੀ ਕੰਮ ਫੇਲ ਹੋਵੇ, ਤਾਂ ਇਹ ਬਲਾਕ ਚੱਲੇਗਾ
+        print(f"CRITICAL ERROR: {e}", flush=True)
+        report_critical_error(str(e), trades)
 
 if __name__ == "__main__":
     main()
