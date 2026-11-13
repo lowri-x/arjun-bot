@@ -1,31 +1,33 @@
-name: Arjun Cloud Scanner
+name: Arjun Cloud Scanner V3
 
 on:
   schedule:
-    # 🚀 UTC ਟਾਈਮ: 4:00 AM to 9:55 AM = ਭਾਰਤੀ ਸਮਾਂ 9:30 AM to 3:25 PM
-    - cron: '*/5 4-9 * * 1-5'
-  workflow_dispatch: # ਮੈਨੂਅਲ ਟੈਸਟ ਲਈ
+    # 🚀 ਸੈਸ਼ਨ 1: 8:52 AM IST (3:22 AM UTC)
+    - cron: '22 3 * * 1-5'
+    # 🚀 ਸੈਸ਼ਨ 2: 12:30 PM IST (7:00 AM UTC) - ਓਵਰਲੈਪ ਤੋਂ ਬਚਣ ਲਈ 12:47 ਤੋਂ ਪਹਿਲਾਂ
+    - cron: '0 7 * * 1-5'
+    # 🚀 ਕਲੋਜਿੰਗ ਮੈਸੇਜ: 3:20 PM IST (9:50 AM UTC)
+    - cron: '50 9 * * 1-5'
+  workflow_dispatch:
 
 concurrency:
-  group: arjun-scanner-group
-  cancel-in-progress: true # ਓਵਰਲੈਪਿੰਗ ਰਨ ਰੋਕਣ ਲਈ
+  group: arjun-options-scanner-v3
+  cancel-in-progress: false
 
 jobs:
   scan:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    # 🚨 timeout 215 (3.5 ਘੰਟੇ) ਤਾਂਕਿ ਸੈਸ਼ਨ 1, 12:27 ਵਜੇ ਖਤਮ ਹੋ ਜਾਵੇ
+    timeout-minutes: 215 
 
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: '3.10'
-          
-      - name: Install dependencies
-        run: |
-          pip install requests pandas smartapi-python pyotp logzero websocket-client
-          
-      - name: Run Arjun Scanner
+          python-version: '3.11'
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: Run Arjun scanner
         env:
           API_KEY: ${{ secrets.API_KEY }}
           CLIENT_ID: ${{ secrets.CLIENT_ID }}
@@ -35,4 +37,7 @@ jobs:
           CHAT_ID: ${{ secrets.CHAT_ID }}
           GIST_ID: ${{ secrets.GIST_ID }}
           GIST_TOKEN: ${{ secrets.GIST_TOKEN }}
+          # 🚨 MAX_RISK 2000 ਕਰ ਦਿੱਤਾ ਹੈ
+          MAX_RISK_PER_TRADE: '2000'
+          POLL_SECONDS: '300'
         run: python -u arjun_cloud.py
