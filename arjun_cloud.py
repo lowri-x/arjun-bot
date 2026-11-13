@@ -1,378 +1,426 @@
-import urllib.request
-import json
-import ssl
-import os
-import time
-import requests
-import pandas as pd
+from __future__ import annotations
+import json, logging, math, os, time
+from datetime import datetime, timedelta, time as dtime
+from zoneinfo import ZoneInfo
+from pathlib import Path
 import numpy as np
-from datetime import datetime, timedelta, timezone
-from SmartApi import SmartConnect
+import pandas as pd
+import requests
 import pyotp
+from SmartApi import SmartConnect
 
-# ==================== ਕ੍ਰੈਡੈਂਸ਼ੀਅਲਜ਼ ====================
-API_KEY = os.environ.get("API_KEY")
-CLIENT_ID = os.environ.get("CLIENT_ID")
-PASSWORD = os.environ.get("PASSWORD")
-TOTP_SECRET = os.environ.get("TOTP_SECRET")
-BOT_TOKEN = os.environ.get("BOT_TOKEN")
-CHAT_ID = os.environ.get("CHAT_ID")
-GIST_ID = os.environ.get("GIST_ID")
-GIST_TOKEN = os.environ.get("GIST_TOKEN")
+IST = ZoneInfo('Asia/Kolkata')
+ROOT = Path(__file__).parent
 
-INDEX_TOKENS = {
-    "NIFTY 50": {"token": "99926000", "symbol": "NIFTY", "exch": "NFO", "index_exch": "NSE", "step": 50, "default_lot": 25},
-    "BANK NIFTY": {"token": "99926009", "symbol": "BANKNIFTY", "exch": "NFO", "index_exch": "NSE", "step": 100, "default_lot": 15}
+INDEXES = {
+    "NIFTY 50": {"token": "99926000", "symbol": "NIFTY", "step": 50},
+    "BANK NIFTY": {"token": "99926009", "symbol": "BANKNIFTY", "step": 100}
+}
+VIX_TOKEN = "99926017"
+
+# 🚨 2026 ਦੀਆਂ ਛੁੱਟੀਆਂ (ਅਧਿਕਾਰਤ NSE ਸੂਚੀ ਅਨੁਸਾਰ)
+HOLIDAYS = {
+    "2026-01-15", "2026-01-26", "2026-03-03", "2026-03-26", "2026-03-31",
+    "2026-04-03", "2026-04-14", "2026-05-01", "2026-05-28", "2026-06-26", 
+    "2026-09-14", "2026-10-02", "2026-10-20", "2026-11-09", "2026-11-10", 
+    "2026-11-24", "2026-12-25"
 }
 
-def get_ist_time():
-    return datetime.now(timezone.utc) + timedelta(hours=5, minutes=30)
+ENV = {k: os.getenv(k) for k in ["API_KEY", "CLIENT_ID", "PASSWORD", "TOTP_SECRET", "BOT_TOKEN", "CHAT_ID", "GIST_ID", "GIST_TOKEN"]}
+MAX_RISK = float(os.getenv("MAX_RISK_PER_TRADE", "2000"))
+POLL = int(os.getenv("POLL_SECONDS", "300"))
 
-def is_valid_trading_time():
-    now = get_ist_time()
-    if now.weekday() >= 5: return False
-    # 9:30 AM ਤੋਂ ਪਹਿਲਾਂ ਅਤੇ 3:15 PM ਤੋਂ ਬਾਅਦ ਟ੍ਰੇਡ ਨਹੀਂ
-    if now.hour == 9 and now.minute < 30: return False
-    if now.hour > 15 or (now.hour == 15 and now.minute > 15): return False
-    return True
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("arjun")
 
-def is_market_open():
-    now = get_ist_time()
-    if now.weekday() >= 5: return False
-    if now.hour < 9 or (now.hour == 9 and now.minute < 15): return False
-    if now.hour > 15 or (now.hour == 15 and now.minute > 30): return False
-    return True
+DEFAULT_STATE = {"active": [], "history": [], "last_start_msg": "", "last_end_msg": "", "last_signal": {}}
 
-def send_telegram(text):
-    if not BOT_TOKEN or not CHAT_ID: return
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    data = json.dumps({"chat_id": CHAT_ID, "text": text, "parse_mode": "HTML"}).encode('utf-8')
-    req = urllib.request.Request(url, data=data, headers={'Content-Type': 'application/json'})
-    ctx = ssl.create_default_context(); ctx.check_hostname = False; ctx.verify_mode = ssl.CERT_NONE
-    try: urllib.request.urlopen(req, context=ctx, timeout=10)
-    except Exception as e: print(f"Telegram Error: {e}", flush=True)
+def now():
+    return datetime.now(IST)
 
-# ==================== GIST ਹੈਂਡਲਿੰਗ ====================
-def load_trades():
-    if not GIST_ID or not GIST_TOKEN: return {"active": [], "history": [], "last_start_msg": "", "last_end_msg": ""}
-    headers = {"Authorization": f"token {GIST_TOKEN}"}
+def require_env():
+    missing = [k for k, v in ENV.items() if not v]
+    if missing:
+        raise RuntimeError("Missing GitHub Secrets: " + ", ".join(missing))
+
+def tg(msg):
+    if not ENV["BOT_TOKEN"] or not ENV["CHAT_ID"]: return
     try:
-        res = requests.get(f"https://api.github.com/gists/{GIST_ID}", headers=headers)
-        if res.status_code == 200:
-            content = json.loads(res.json()['files']['trades.json']['content'])
-            if "last_start_msg" not in content: content["last_start_msg"] = ""
-            if "last_end_msg" not in content: content["last_end_msg"] = ""
-            return content
-    except: pass
-    return {"active": [], "history": [], "last_start_msg": "", "last_end_msg": ""}
+        url = f'https://api.telegram.org/bot{ENV["BOT_TOKEN"]}/sendMessage'
+        r = requests.post(url, json={"chat_id": ENV["CHAT_ID"], "text": msg, "parse_mode": "HTML"}, timeout=15)
+        r.raise_for_status()
+    except Exception:
+        log.exception("Telegram send failed")
 
-def save_trades(trades):
-    if not GIST_ID or not GIST_TOKEN: return
-    headers = {"Authorization": f"token {GIST_TOKEN}"}
-    payload = {"files": {"trades.json": {"content": json.dumps(trades, indent=4)}}}
-    try: requests.patch(f"https://api.github.com/gists/{GIST_ID}", headers=headers, json=payload)
-    except: pass
+def headers():
+    return {
+        "Authorization": "Bearer " + ENV["GIST_TOKEN"],
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28"
+    }
 
-# ==================== ਡੇਟਾ ਫੈਚਿੰਗ ====================
-def fetch_angel_candles(angel, token, exch, interval):
-    now_ist = get_ist_time()
-    from_date = (now_ist - timedelta(days=5)).strftime("%Y-%m-%d %H:%M")
-    to_date = now_ist.strftime("%Y-%m-%d %H:%M")
+def validate_state(state):
+    if not isinstance(state, dict) or not isinstance(state.get("history"), list):
+        raise RuntimeError("Gist state invalid; refusing to reset paper trades.")
+    for k, v in DEFAULT_STATE.items():
+        state.setdefault(k, v.copy() if isinstance(v, (list, dict)) else v)
+    return state
+
+def load_state():
+    if ENV["GIST_ID"] and ENV["GIST_TOKEN"]:
+        r = requests.get(f"https://api.github.com/gists/{ENV['GIST_ID']}", headers=headers(), timeout=20)
+        r.raise_for_status()
+        files = r.json().get("files", {})
+        if "trades.json" not in files:
+            raise RuntimeError("Gist missing trades.json")
+        return validate_state(json.loads(files["trades.json"]["content"]))
     
-    for attempt in range(2):
-        try:
-            time.sleep(2.5) 
-            data = angel.getCandleData({
-                "exchange": exch, "symboltoken": token, "interval": interval,
-                "fromdate": from_date, "todate": to_date
-            })
-            
-            if data and isinstance(data, dict) and data.get('status') == True and isinstance(data.get('data'), list) and len(data['data']) > 0:
-                df = pd.DataFrame(data['data'], columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-                numeric_cols = ['open', 'high', 'low', 'close']
-                df[numeric_cols] = df[numeric_cols].apply(pd.to_numeric, errors='coerce')
-                df = df.dropna(subset=numeric_cols)
-                
-                last_time_str = "Unknown"
-                if not df.empty:
-                    last_ts = data['data'][-1][0]
-                    try:
-                        if isinstance(last_ts, (int, float)):
-                            last_time = datetime.fromtimestamp(last_ts / 1000, timezone.utc) + timedelta(hours=5, minutes=30)
-                        else:
-                            last_time = pd.to_datetime(last_ts).tz_convert('Asia/Kolkata')
-                        last_time_str = last_time.strftime("%H:%M")
-                    except: pass
-                        
-                return df[['open', 'high', 'low', 'close']], last_time_str
-        except: pass
-    return None, None
+    p = ROOT / "trades.json"
+    if p.exists():
+        return validate_state(json.loads(p.read_text()))
+    return validate_state(json.loads(json.dumps(DEFAULT_STATE)))
 
-# ==================== ਇੰਡੀਕੇਟਰਜ਼ ====================
-def add_indicators(df):
-    df = df.copy()
-    close, high, low, open_ = df["close"], df["high"], df["low"], df["open"]
+def save_state(state):
+    content = json.dumps(state, indent=2, ensure_ascii=False)
+    if ENV["GIST_ID"] and ENV["GIST_TOKEN"]:
+        r = requests.patch(
+            f"https://api.github.com/gists/{ENV['GIST_ID']}",
+            headers=headers(),
+            json={"files": {"trades.json": {"content": content}}},
+            timeout=20
+        )
+        r.raise_for_status()
+    else:
+        p = ROOT / "trades.json"
+        tmp = p.with_suffix(".tmp")
+        tmp.write_text(content)
+        tmp.replace(p)
+
+def login():
+    a = SmartConnect(api_key=ENV["API_KEY"])
+    res = a.generateSession(ENV["CLIENT_ID"], ENV["PASSWORD"], pyotp.TOTP(ENV["TOTP_SECRET"]).now())
+    if not isinstance(res, dict) or res.get("status") is not True:
+        raise RuntimeError("Angel One login failed")
+    return a
+
+def instruments():
+    p = ROOT / "instruments.json"
+    if not p.exists() or time.time() - p.stat().st_mtime > 20 * 3600:
+        u = "https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json"
+        r = requests.get(u, timeout=45)
+        r.raise_for_status()
+        data = r.json()
+        if not isinstance(data, list) or not data:
+            raise RuntimeError("Invalid instrument master")
+        p.write_text(json.dumps(data))
     
-    df["ema9"] = close.ewm(span=9, adjust=False).mean()
-    df["ema21"] = close.ewm(span=21, adjust=False).mean()
-    
-    delta = close.diff()
-    gain = delta.clip(lower=0).ewm(alpha=1/14, adjust=False).mean()
-    loss = (-delta.clip(upper=0)).ewm(alpha=1/14, adjust=False).mean()
-    rs = gain / loss.replace(0, np.nan)
-    df["rsi"] = 100 - (100 / (1 + rs))
-
-    prev_close = close.shift(1)
-    tr = pd.concat([high - low, (high - prev_close).abs(), (low - prev_close).abs()], axis=1).max(axis=1)
-    df["atr"] = tr.ewm(alpha=1/14, adjust=False).mean()
-
-    up_move = high.diff()
-    down_move = -low.diff()
-    plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0.0)
-    minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
-    atr_smooth = tr.ewm(alpha=1/14, adjust=False).mean()
-    
-    df["plus_di"] = 100 * pd.Series(plus_dm, index=df.index).ewm(alpha=1/14, adjust=False).mean() / atr_smooth
-    df["minus_di"] = 100 * pd.Series(minus_dm, index=df.index).ewm(alpha=1/14, adjust=False).mean() / atr_smooth
-    dx = 100 * (df["plus_di"] - df["minus_di"]).abs() / (df["plus_di"] + df["minus_di"]).replace(0, np.nan)
-    df["adx"] = dx.ewm(alpha=1/14, adjust=False).mean()
-
-    hl2 = (high + low) / 2
-    upper = (hl2 + 3.0 * df["atr"]).to_numpy()
-    lower = (hl2 - 3.0 * df["atr"]).to_numpy()
-    c = close.to_numpy()
-    st = np.zeros(len(df))
-    trend = np.ones(len(df), dtype=int)
-
-    for i in range(1, len(df)):
-        if c[i-1] > upper[i-1]: lower[i] = max(lower[i], lower[i-1]) if trend[i-1]==1 else lower[i]
-        if c[i-1] < lower[i-1]: upper[i] = min(upper[i], upper[i-1]) if trend[i-1]==-1 else upper[i]
-        
-        if trend[i-1] == 1:
-            if c[i] < lower[i]: trend[i] = -1; st[i] = upper[i]
-            else: trend[i] = 1; st[i] = lower[i]
-        else:
-            if c[i] > upper[i]: trend[i] = 1; st[i] = lower[i]
-            else: trend[i] = -1; st[i] = upper[i]
-            
-    df["st_dir"] = trend
-
-    body = (close - open_).abs()
-    candle_range = (high - low).replace(0, np.nan)
-    upper_wick = high - np.maximum(open_, close)
-    lower_wick = np.minimum(open_, close) - low
-    
-    prev_bull = close.shift(1) > open_.shift(1)
-    prev_bear = close.shift(1) < open_.shift(1)
-    curr_bull = close > open_
-    curr_bear = close < open_
-
-    df["pat_bull_engulf"] = prev_bear & curr_bull & (close >= open_.shift(1)) & (open_ <= close.shift(1)) & (body > body.shift(1))
-    df["pat_bear_engulf"] = prev_bull & curr_bear & (close <= open_.shift(1)) & (open_ >= close.shift(1)) & (body > body.shift(1))
-    df["pat_hammer"] = (lower_wick >= 2.0 * body) & (upper_wick <= 0.3 * candle_range)
-    df["pat_shooting_star"] = (upper_wick >= 2.0 * body) & (lower_wick <= 0.3 * candle_range)
-    
+    df = pd.DataFrame(json.loads(p.read_text()))
+    required = {"token", "symbol", "name", "expiry", "strike", "lotsize", "instrumenttype", "exch_seg"}
+    if not required.issubset(df.columns):
+        raise RuntimeError("Instrument master schema changed")
     return df
 
-# ==================== ਆਪਸ਼ਨ ਚੇਨ ====================
-def find_option_token(index_name, strike_price, option_type, instrument_df):
-    symbol_name = INDEX_TOKENS[index_name]["symbol"]
-    exch = INDEX_TOKENS[index_name]["exch"]
-    target_strike = float(strike_price) * 100
-    opts = instrument_df[(instrument_df['name'] == symbol_name) & (instrument_df['instrumenttype'] == 'OPTIDX') & (instrument_df['exch_seg'] == exch)].copy()
-    if opts.empty: return None, None, None, INDEX_TOKENS[index_name]["default_lot"]
-    
-    opts['strike_float'] = pd.to_numeric(opts['strike'], errors='coerce')
-    match = opts[opts['strike_float'] == target_strike]
-    
-    if match.empty:
-        avail = opts['strike_float'].dropna().unique()
-        if len(avail) == 0: return None, None, None, INDEX_TOKENS[index_name]["default_lot"]
-        match = opts[opts['strike_float'] == min(avail, key=lambda x: abs(x - target_strike))]
-        
-    match = match[match['symbol'].str.endswith(option_type)]
-    if match.empty: return None, None, None, INDEX_TOKENS[index_name]["default_lot"]
-    
-    try: lot_size = int(float(match.iloc[0]['lotsize']))
-    except: lot_size = INDEX_TOKENS[index_name]["default_lot"]
-        
-    return match.iloc[0]['token'], match.iloc[0]['symbol'], exch, lot_size
-
-def get_option_ltp(angel, token, exch):
-    try:
-        data = angel.ltpData(exch, "", token)
-        if data['status']: return data['data']['ltp']
-    except: return 0
-
-# ==================== ਟ੍ਰੇਡ ਟ੍ਰੈਕਿੰਗ ====================
-def check_active_trades(trades, angel):
-    remaining = []
-    for trade in trades["active"]:
-        current_premium = get_option_ltp(angel, trade["opt_token"], trade["exch"])
-        if current_premium == 0:
-            remaining.append(trade)
-            continue
-
-        status = None
-        if trade["type"] == "CE":
-            if current_premium >= trade["target_premium"]: status = "PASS (Target Hit) ✅"
-            elif current_premium <= trade["sl_premium"]: status = "FAIL (SL Hit) ❌"
-        elif trade["type"] == "PE":
-            if current_premium <= trade["target_premium"]: status = "PASS (Target Hit) ✅"
-            elif current_premium >= trade["sl_premium"]: status = "FAIL (SL Hit) ❌"
-            
-        if status:
-            trade["status"] = status
-            trade["exit_premium"] = current_premium
-            trades["history"].append(trade)
-            emoji = "✅" if "PASS" in status else "❌"
-            msg = f"{emoji} <b>{trade['name']} ਟ੍ਰੇਡ ਬੰਦ ਹੋਇਆ!</b>\nਸਟੇਟਸ: {status}\nEntry: ₹{trade['entry_premium']:.2f} | Exit: ₹{current_premium:.2f}"
-            send_telegram(msg)
-        else:
-            remaining.append(trade)
-    trades["active"] = remaining
-    return trades
-
-# ==================== ਮੁੱਖ ਲੂਪ ====================
-def main():
-    if not is_market_open(): return
-
-    trades = load_trades()
-    now = get_ist_time()
-    today_str = now.strftime("%Y-%m-%d")
-    current_time_str = now.strftime("%H:%M")
-
-    # 1. ਸਮਾਂ ਗਾਰਡ: 9:30 ਤੋਂ ਪਹਿਲਾਂ ਅਤੇ 3:15 ਤੋਂ ਬਾਅਦ ਟ੍ਰੇਡ ਨਹੀਂ
-    if not is_valid_trading_time():
-        print("ਟ੍ਰੇਡਿੰਗ ਵਿੰਡੋ ਤੋਂ ਬਾਹਰ (9:30 AM - 3:15 PM)।", flush=True)
-        return
-
-    if trades.get("last_start_msg") != today_str:
-        send_telegram(f"✅ <b>LowriX ਬੋਟ ਚਾਲੂ ਹੋ ਗਿਆ ਹੈ!</b>\nਮਾਰਕੀਟ ਖੁੱਲ੍ਹ ਗਈ ਹੈ।\n⏰ ਸਮਾਂ: {current_time_str}")
-        trades["last_start_msg"] = today_str
-        save_trades(trades)
-
-    try:
-        angel = SmartConnect(api_key=API_KEY)
-        totp = pyotp.TOTP(TOTP_SECRET).now()
-        session_data = angel.generateSession(CLIENT_ID, PASSWORD, totp)
-        if not session_data['status']:
-            raise Exception("Angel One ਲੌਗਇਨ ਫੇਲ")
-
-        file_path = "instruments.json"
-        if not os.path.exists(file_path):
-            url = "https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json"
-            response = requests.get(url, timeout=20)
-            with open(file_path, 'wb') as f: f.write(response.content)
-                
-        with open(file_path, 'r') as f:
-            instrument_df = pd.DataFrame(json.load(f))
-
-        trades = check_active_trades(trades, angel)
-
-        # VIX ਫਿਲਟਰ (ਡਾਇਨੈਮਿਕ SL ਲਈ)
-        vix = 15.0 # ਡਿਫਾਲਟ
+def candles(a, token, interval, days=5):
+    end = now()
+    start = end - timedelta(days=days)
+    q = {
+        "exchange": "NSE",
+        "symboltoken": str(token),
+        "interval": interval,
+        "fromdate": start.strftime("%Y-%m-%d %H:%M"),
+        "todate": end.strftime("%Y-%m-%d %H:%M")
+    }
+    for n in range(3):
         try:
-            vix_df = fetch_angel_candles(angel, "99919000", "NSE", "ONE_DAY") # India VIX
-            if vix_df and len(vix_df[0]) > 0:
-                vix = vix_df[0]['close'].iloc[-1]
-        except: pass
-
-        for name, info in INDEX_TOKENS.items():
-            df_15, time_15 = fetch_angel_candles(angel, info["token"], info["index_exch"], "FIFTEEN_MINUTE")
-            df_5, time_5 = fetch_angel_candles(angel, info["token"], info["index_exch"], "FIVE_MINUTE")
-            
-            if df_15 is None or df_5 is None or len(df_5) < 30: 
-                continue
-            
-            df_15 = add_indicators(df_15)
-            df_5 = add_indicators(df_5)
-            
-            # 🚨 CANDLE REPAINTING FIX: iloc[-2] ਵਰਤ ਰਹੇ ਹਾਂ (ਪਿਛਲੀ ਪੂਰੀ ਹੋਈ ਕੈਂਡਲ)
-            c5, p5, c15 = df_5.iloc[-2], df_5.iloc[-3], df_15.iloc[-2]
-            
-            htf_bull = (c15["close"] > c15["ema21"]) and (c15["st_dir"] == 1)
-            htf_bear = (c15["close"] < c15["ema21"]) and (c15["st_dir"] == -1)
-            
-            # ADX > 20 (ਸਖ਼ਤ ਫਿਲਟਰ) ਅਤੇ ਵਧ ਰਿਹਾ ਹੋਵੇ
-            adx_expanding = (c5["adx"] > 20.0) and (c5["adx"] > p5["adx"])
-            bull_candle = bool(c5["pat_bull_engulf"] or c5["pat_hammer"] or (c5["close"] > p5["high"]))
-            bear_candle = bool(c5["pat_bear_engulf"] or c5["pat_shooting_star"] or (c5["close"] < p5["low"]))
-
-            new_signal = None
-            
-            if htf_bull and (c5["ema9"] > c5["ema21"]) and (52 <= c5["rsi"] <= 75) and adx_expanding and (c5["plus_di"] > c5["minus_di"]) and bull_candle:
-                new_signal = "CE"
-            elif htf_bear and (c5["ema9"] < c5["ema21"]) and (25 <= c5["rsi"] <= 48) and adx_expanding and (c5["minus_di"] > c5["plus_di"]) and bear_candle:
-                new_signal = "PE"
-
-            if new_signal and not any(t["name"] == name for t in trades["active"]):
-                step = info["step"]
-                strike = round((c5['close'] + step) / step) * step if new_signal == "CE" else round((c5['close'] - step) / step) * step
-                
-                opt_token, opt_symbol, exch, lot_size = find_option_token(name, strike, new_signal, instrument_df)
-                
-                if opt_token and lot_size > 0:
-                    entry_premium = get_option_ltp(angel, opt_token, exch)
-                    if entry_premium > 0:
-                        # 🚨 ਡਾਇਨੈਮਿਕ SL ਲਾਜਿਕ (25% ਤੋਂ 30%)
-                        base_sl_pct = 0.25
-                        if vix > 18 or c15["atr"] > (c15['close'] * 0.015):
-                            sl_pct = 0.30 # ਵੱਧ ਤੋਂ ਵੱਧ 30%
-                        else:
-                            sl_pct = base_sl_pct
-                            
-                        sl_distance = entry_premium * sl_pct
-                        target_distance = sl_distance * 1.5 # 1:1.5 R:R
-                        
-                        sl_premium = entry_premium - sl_distance if new_signal == "CE" else entry_premium + sl_distance
-                        target_premium = entry_premium + target_distance if new_signal == "CE" else entry_premium - target_distance
-
-                        risk_per_lot = sl_distance * lot_size
-                        
-                        if risk_per_lot <= 300: risk_status = "✅ ਘੱਟ ਰਿਸਕ"
-                        elif risk_per_lot <= 600: risk_status = "⚠️ ਦਰਮਿਆਨਾ ਰਿਸਕ"
-                        else: risk_status = "🚨 ਵੱਧ ਰਿਸਕ"
-                        
-                        trade = {
-                            "name": name, "type": new_signal, "symbol": opt_symbol,
-                            "opt_token": opt_token, "exch": exch,
-                            "entry_premium": entry_premium, "sl_premium": sl_premium, 
-                            "target_premium": target_premium, "qty": lot_size,
-                            "time": get_ist_time().strftime("%Y-%m-%d %H:%M")
-                        }
-                        trades["active"].append(trade)
-                        
-                        msg = f"🚀 <b>ਨਵਾਂ {new_signal} ਸਿਗਨਲ</b>\n\n"
-                        msg += f"⏰ <b>ਡੇਟਾ ਸਮਾਂ:</b> {time_5} ਵਜੇ ਦਾ\n"
-                        msg += f"⏰ <b>ਅਲਰਟ ਸਮਾਂ:</b> {current_time_str} ਵਜੇ\n\n"
-                        msg += f"📊 {name} (₹{c5['close']:.2f})\n"
-                        msg += f"🎯 {opt_symbol}\n"
-                        msg += f"💰 Entry: ₹{entry_premium:.2f}\n"
-                        msg += f"🛑 SL: ₹{sl_premium:.2f} ({int(sl_pct*100)}%)\n"
-                        msg += f"🎯 Target: ₹{target_premium:.2f} (1:1.5)\n"
-                        msg += f"📦 Qty: {lot_size} (1 Lot)\n"
-                        msg += f"💵 <b>Total Risk: ₹{risk_per_lot:.2f}</b>\n"
-                        msg += f"ℹ️ ਸਥਿਤੀ: {risk_status}"
-                        send_telegram(msg)
-                        print(f"-> {name}: ✅ ਸਿਗਨਲ ਮਿਲਿਆ - {new_signal} (SL: {sl_pct*100}%)", flush=True)
-                else:
-                    print(f"-> {name}: ਸਟ੍ਰਾਈਕ {strike} ਨਹੀਂ ਮਿਲਿਆ।", flush=True)
+            time.sleep(1.2)
+            x = a.getCandleData(q)
+            if not isinstance(x, dict) or x.get("status") is not True or not x.get("data"):
+                raise RuntimeError("SmartAPI candle response invalid/empty")
+            df = pd.DataFrame(x["data"], columns=["timestamp", "open", "high", "low", "close", "volume"])
+            df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
+            if df["timestamp"].dt.tz is None:
+                df["timestamp"] = df["timestamp"].dt.tz_localize(IST)
             else:
-                if c5["rsi"] >= 52: search_type = "CE (Call)"
-                elif c5["rsi"] <= 48: search_type = "PE (Put)"
-                else: search_type = "Neutral"
-                
-                print(f"-> {name}: {search_type} ਲੱਭ ਰਹੇ ਹਾਂ... (ਡੇਟਾ: {time_5} | RSI: {c5['rsi']:.1f}, ADX: {c5['adx']:.1f})", flush=True)
+                df["timestamp"] = df["timestamp"].dt.tz_convert(IST)
+            for c in ["open", "high", "low", "close", "volume"]:
+                df[c] = pd.to_numeric(df[c], errors="coerce")
+            df = df.dropna(subset=["timestamp", "open", "high", "low", "close"])
+            df = df[(df.high >= df.low) & (df.open > 0) & (df.close > 0)]
+            return df.sort_values("timestamp").drop_duplicates("timestamp").reset_index(drop=True)
+        except Exception as e:
+            error = e
+            log.warning("Candle API failed: %s", e)
+            time.sleep(2 * (n + 1))
+    raise RuntimeError(f"Candle API failed: {error}")
 
-        save_trades(trades)
+def completed(df, m):
+    cutoff = now() - timedelta(minutes=m)
+    return df[df["timestamp"] < cutoff].copy().reset_index(drop=True)
 
+def wilder(s, n=14):
+    return s.ewm(alpha=1/n, adjust=False, min_periods=n).mean()
+
+def indicator(df):
+    x = df.copy()
+    c, h, l, o = x.close, x.high, x.low, x.open
+    
+    x['ema9'] = c.ewm(span=9, adjust=False).mean()
+    x['ema21'] = c.ewm(span=21, adjust=False).mean()
+    
+    delta = c.diff()
+    gain = wilder(delta.clip(lower=0))
+    loss = wilder(-delta.clip(upper=0))
+    rs = 100 - (100 / (1 + gain / loss.replace(0, np.nan)))
+    x['rsi'] = rs.where(~((loss == 0) & (gain > 0)), 100).fillna(50)
+    
+    pc = c.shift(1)
+    tr = pd.concat([(h - l), (h - pc).abs(), (l - pc).abs()], axis=1).max(axis=1)
+    x['atr'] = wilder(tr)
+    
+    up, dn = h.diff(), -l.diff()
+    pdm, mdm = pd.Series(np.where((up > dn) & (up > 0), up, 0.0), index=x.index), pd.Series(np.where((dn > up) & (dn > 0), dn, 0.0), index=x.index)
+    pdi = 100 * wilder(pdm) / x['atr'].replace(0, np.nan)
+    mdi = 100 * wilder(mdm) / x['atr'].replace(0, np.nan)
+    x['plus_di'], x['minus_di'] = pdi, mdi
+    dx = 100 * (pdi - mdi).abs() / (pdi + mdi).replace(0, np.nan)
+    x['adx'] = wilder(dx)
+    
+    ml = (h + l) / 2
+    ub, lb = ml + 3 * x['atr'], ml - 3 * x['atr']
+    fu, fl = ub.copy(), lb.copy()
+    dir = pd.Series(index=x.index, dtype=int)
+    
+    for i in range(1, len(x)):
+        if c.iloc[i] > fu.iloc[i-1]: dir.iloc[i] = 1
+        elif c.iloc[i] < fl.iloc[i-1]: dir.iloc[i] = -1
+        else: dir.iloc[i] = dir.iloc[i-1]
+        if dir.iloc[i] == 1:
+            fl.iloc[i] = max(fl.iloc[i], fl.iloc[i-1]) if dir.iloc[i-1] == 1 else fl.iloc[i]
+        else:
+            fu.iloc[i] = min(fu.iloc[i], fu.iloc[i-1]) if dir.iloc[i-1] == -1 else fu.iloc[i]
+    x['st_dir'] = dir
+    
+    body = (c - o).abs()
+    rng = (h - l).replace(0, np.nan)
+    uw, lw = h - np.maximum(o, c), np.minimum(o, c) - l
+    pb, prb = (c.shift(1) > o.shift(1)), (c.shift(1) < o.shift(1))
+    cb, crb = (c > o), (c < o)
+    
+    x['pat_bull_engulf'] = prb & cb & (c >= o.shift(1)) & (o <= c.shift(1)) & (body > body.shift(1))
+    x['pat_bear_engulf'] = pb & crb & (c <= o.shift(1)) & (o >= c.shift(1)) & (body > body.shift(1))
+    x['pat_hammer'] = (lw >= 2.0 * body) & (uw <= 0.3 * rng)
+    x['pat_shooting_star'] = (uw >= 2.0 * body) & (lw <= 0.3 * rng)
+    
+    return x
+
+def ltp(a, exchange, symbol, token):
+    r = a.ltpData(exchange, symbol, str(token))
+    if not isinstance(r, dict) or r.get("status") is not True:
+        raise RuntimeError("LTP API failed")
+    v = float(r["data"]["ltp"])
+    if not math.isfinite(v) or v <= 0:
+        raise RuntimeError("Invalid LTP")
+    return v
+
+def find_contract(master, index, strike, kind, day):
+    sym = INDEXES[index]["symbol"]
+    d = master[(master.name.astype(str) == sym) & (master.instrumenttype.astype(str) == 'OPTIDX') & (master.exch_seg.astype(str) == 'NFO')].copy()
+    d = d[d.symbol.astype(str).str.endswith(kind)]
+    
+    # 🚨 EXPIRY FIX: mixed format ਅਤੇ nearest expiry
+    d['expiry_dt'] = pd.to_datetime(d['expiry'], errors='coerce', format='mixed')
+    d = d[d.expiry_dt.notna() & (d.expiry_dt >= pd.Timestamp(day))]
+    d['strike_num'] = pd.to_numeric(d['strike'], errors='coerce')
+    
+    if d.empty: return None
+    
+    # nearest expiry sort
+    d = d.sort_values("expiry_dt")
+    match = d[d.strike_num == float(strike)]
+    if match.empty: return None
+    
+    r = match.iloc[0]
+    try: lot = int(float(r['lotsize']))
+    except: return None
+    if lot <= 0: return None
+    return str(r['token']), str(r['symbol']), 'NFO', lot
+
+def signal_for(d5, d15):
+    if len(d5) < 40 or len(d15) < 40: return None
+    d5 = indicator(d5)
+    d15 = indicator(d15)
+    
+    c15 = d15.iloc[-1]
+    htf_bull = (c15.close > c15.ema21) and (c15.st_dir == 1)
+    htf_bear = (c15.close < c15.ema21) and (c15.st_dir == -1)
+    
+    c5, p5 = d5.iloc[-1], d5.iloc[-2]
+    adx_ok = (c5.adx > 20) and (c5.adx > p5.adx)
+    bull_candle = bool(c5.pat_bull_engulf or c5.pat_hammer or (c5.close > p5.high))
+    bear_candle = bool(c5.pat_bear_engulf or c5.pat_shooting_star or (c5.close < p5.low))
+    
+    if htf_bull and (c5.ema9 > c5.ema21) and (52 <= c5.rsi <= 75) and adx_ok and (c5.plus_di > c5.minus_di) and bull_candle: 
+        return "CE"
+    if htf_bear and (c5.ema9 < c5.ema21) and (25 <= c5.rsi <= 48) and adx_ok and (c5.minus_di > c5.plus_di) and bear_candle: 
+        return "PE"
+    return None
+
+def monitor(state, a):
+    keep = []
+    for t in state["active"]:
+        try:
+            v = ltp(a, t["exch"], t["symbol"], t["opt_token"])
+        except Exception as e:
+            log.warning("Trade monitor unavailable: %s", e)
+            keep.append(t)
+            continue
+            
+        status = "TARGET_HIT" if v >= t["target_premium"] else ("STOP_LOSS_HIT" if v <= t["sl_premium"] else None)
+        if status:
+            t["status"] = status
+            t["exit_premium"] = v
+            t["exit_time"] = now().isoformat()
+            state["history"].append(t)
+            emoji = "✅" if status == "TARGET_HIT" else "❌"
+            tg(f"{emoji} <b>{t['name']} {t['type']} ਟ੍ਰੇਡ ਬੰਦ</b>\n{status}\nEntry: ₹{t['entry_premium']:.2f} | Exit: ₹{v:.2f}")
+        else:
+            keep.append(t)
+    state["active"] = keep
+
+def eod_close(state, a):
+    for t in state["active"]:
+        try:
+            v = ltp(a, t["exch"], t["symbol"], t["opt_token"])
+            t["exit_premium"] = v
+            t["status"] = "EOD_CLOSED_PAPER"
+            t["pnl_before_costs"] = round((v - t["entry_premium"]) * t["qty"], 2)
+        except Exception as e:
+            t["exit_premium"] = None
+            t["status"] = "UNRESOLVED_EOD"
+            t["note"] = str(e)
+        t["exit_time"] = now().isoformat()
+        state["history"].append(t)
+        tg(f"🔴 EOD <b>{t['name']} {t['type']}</b>\n{t['status']} | Exit: ₹{t.get('exit_premium', 'N/A')}")
+    state["active"] = []
+
+def scan(a, master, state):
+    monitor(state, a)
+    try:
+        vix = ltp(a, 'NSE', 'India VIX', VIX_TOKEN)
     except Exception as e:
-        print(f"CRITICAL ERROR: {e}", flush=True)
-        if trades.get("last_error_date") != today_str:
-            send_telegram(f"🚨 <b>LowriX ਬੋਟ ਵਿੱਚ ਸਮੱਸਿਆ ਆਈ ਹੈ!</b>\n\n<code>{str(e)}</code>")
-            trades["last_error_date"] = today_str
-            save_trades(trades)
+        log.error('India VIX unavailable; skip new entries: %s', e)
+        save_state(state)
+        return
+        
+    for name, cfg in INDEXES.items():
+        try:
+            d15 = completed(candles(a, cfg['token'], 'FIFTEEN_MINUTE'), 15)
+            d5 = completed(candles(a, cfg['token'], 'FIVE_MINUTE'), 5)
+            if len(d5) < 40 or len(d15) < 40: continue
+            
+            kind = signal_for(d5, d15)
+            if not kind or any(t['name'] == name for t in state['active']): continue
+            
+            bar = d5.iloc[-1].timestamp.isoformat()
+            key = f"{name}|{kind}|{bar}"
+            if state['last_signal'].get(name) == key: continue
+            
+            spot = float(d5.iloc[-1].close)
+            step = cfg['step']
+            strike = round((spot + step) / step) * step if kind == 'CE' else round((spot - step) / step) * step
+            
+            contract = find_contract(master, name, strike, kind, now())
+            if not contract:
+                log.warning("No exact option contract: %s %s %s", name, strike, kind)
+                state['last_signal'][name] = key
+                continue
+                
+            token, symbol, ex, lot = contract
+            premium = ltp(a, ex, symbol, token)
+            atr_ratio = float(indicator(d15).iloc[-1].atr) / max(float(d15.iloc[-1].close), 1e-9)
+            
+            pct = 0.30 if vix > 18 or atr_ratio > 0.015 else 0.25
+            sl = premium * (1 - pct)
+            target = premium * (1 + pct * 1.5)
+            risk = (premium - sl) * lot
+            
+            if risk > MAX_RISK:
+                log.info('Risk cap blocked %s: %.2f', name, risk)
+                state['last_signal'][name] = key
+                continue
+                
+            trade = {
+                'name': name, 'type': kind, 'side': 'BUY', 'symbol': symbol, 'opt_token': token, 'exch': ex,
+                'entry_premium': premium, 'sl_premium': sl, 'target_premium': target, 'qty': lot,
+                'risk_rupees': round(risk, 2), 'sl_pct': pct, 'signal_candle': bar,
+                'entry_time': now().isoformat(), 'status': 'PAPER_ACTIVE'
+            }
+            state['active'].append(trade)
+            
+            msg = f"🚀 <b>ARJUN {kind} BUY SIGNAL (PAPER)</b>\n\n"
+            msg += f"📊 {name} ({spot:.2f})\n🎯 Option: <b>{symbol}</b>\n"
+            msg += f"💰 Entry: ₹{premium:.2f}\n🛑 SL: ₹{sl:.2f} ({pct:.0%})\n"
+            msg += f"🎯 Target: ₹{target:.2f} (1:1.5)\n"
+            msg += f"📦 Qty: {lot} (1 Lot)\n💵 Risk: ₹{risk:.2f}\n"
+            msg += f"📈 VIX: {vix:.2f}\n\n<i>NO LIVE ORDER PLACED.</i>"
+            tg(msg)
+            
+            state['last_signal'][name] = key
+        except Exception:
+            log.exception('%s scan failed', name)
+            
+    save_state(state)
 
-if __name__ == "__main__":
-    main()
+def run():
+    require_env()
+    n = now()
+    day = n.strftime('%Y-%m-%d')
+    
+    if n.weekday() >= 5 or day in HOLIDAYS:
+        log.info('Weekend/holiday; exit')
+        return
+        
+    state = load_state()
+    
+    if n.time() >= dtime(15, 20):
+        if state.get('last_end_msg') != day:
+            eod_close(state, login())
+            state['last_end_msg'] = day
+            save_state(state)
+            tg('🔴 ARJUN EOD paper tracking complete.')
+        return
+        
+    # 🚨 TIMEOUT FIX: Session 1 ends at 12:25, Session 2 starts at 12:30
+    if dtime(8, 52) <= n.time() < dtime(12, 25):
+        end = datetime(n.year, n.month, n.day, 12, 25, tzinfo=IST)
+    elif dtime(12, 30) <= n.time() < dtime(15, 17):
+        end = datetime(n.year, n.month, n.day, 15, 17, tzinfo=IST)
+    else:
+        log.info('Outside scanner sessions')
+        return
+        
+    a = login()
+    master = instruments()
+    
+    if state.get('last_start_msg') != day:
+        state['last_start_msg'] = day
+        save_state(state)
+        tg(f"✅ ARJUN scanner started {n:%H:%M} IST.\nEntries after 09:30. Paper mode.")
+        
+    while now() < end:
+        if now().time() >= dtime(9, 30):
+            scan(a, master, state)
+        else:
+            log.info('Waiting for 09:30 entry gate')
+            
+        save_state(state)
+        sec = POLL - (now().minute * 60 + now().second) % POLL
+        time.sleep(max(10, min(sec, max(1, int((end - now()).total_seconds())))))
+
+if __name__ == '__main__':
+    try:
+        run()
+    except Exception as e:
+        log.exception('Fatal scanner error')
+        tg(f"🚨 ARJUN scanner error: {type(e).__name__}: {e}")
+        raise
