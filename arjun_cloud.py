@@ -18,7 +18,6 @@ INDEXES = {
 }
 VIX_TOKEN = "99926017"
 
-# 🚨 2026 ਦੀਆਂ ਛੁੱਟੀਆਂ (ਅਧਿਕਾਰਤ NSE ਸੂਚੀ ਅਨੁਸਾਰ)
 HOLIDAYS = {
     "2026-01-15", "2026-01-26", "2026-03-03", "2026-03-26", "2026-03-31",
     "2026-04-03", "2026-04-14", "2026-05-01", "2026-05-28", "2026-06-26", 
@@ -83,13 +82,25 @@ def load_state():
 def save_state(state):
     content = json.dumps(state, indent=2, ensure_ascii=False)
     if ENV["GIST_ID"] and ENV["GIST_TOKEN"]:
-        r = requests.patch(
-            f"https://api.github.com/gists/{ENV['GIST_ID']}",
-            headers=headers(),
-            json={"files": {"trades.json": {"content": content}}},
-            timeout=20
-        )
-        r.raise_for_status()
+        # 🚀 ਰੀਟ੍ਰਾਈ ਲਾਜਿਕ
+        for attempt in range(5):
+            try:
+                r = requests.patch(
+                    f"https://api.github.com/gists/{ENV['GIST_ID']}",
+                    headers=headers(),
+                    json={"files": {"trades.json": {"content": content}}},
+                    timeout=20
+                )
+                r.raise_for_status()
+                break
+            except requests.exceptions.HTTPError as e:
+                if e.response.status_code == 409:
+                    wait_time = 2 ** (attempt + 1)
+                    log.warning(f"Gist conflict (409). Retrying in {wait_time}s...")
+                    time.sleep(wait_time)
+                else:
+                    log.error(f"Gist save failed: {e}")
+                    break
     else:
         p = ROOT / "trades.json"
         tmp = p.with_suffix(".tmp")
@@ -227,14 +238,11 @@ def find_contract(master, index, strike, kind, day):
     d = master[(master.name.astype(str) == sym) & (master.instrumenttype.astype(str) == 'OPTIDX') & (master.exch_seg.astype(str) == 'NFO')].copy()
     d = d[d.symbol.astype(str).str.endswith(kind)]
     
-    # 🚨 EXPIRY FIX: mixed format ਅਤੇ nearest expiry
     d['expiry_dt'] = pd.to_datetime(d['expiry'], errors='coerce', format='mixed')
     d = d[d.expiry_dt.notna() & (d.expiry_dt >= pd.Timestamp(day))]
     d['strike_num'] = pd.to_numeric(d['strike'], errors='coerce')
     
     if d.empty: return None
-    
-    # nearest expiry sort
     d = d.sort_values("expiry_dt")
     match = d[d.strike_num == float(strike)]
     if match.empty: return None
@@ -390,7 +398,6 @@ def run():
             tg('🔴 ARJUN EOD paper tracking complete.')
         return
         
-    # 🚨 TIMEOUT FIX: Session 1 ends at 12:25, Session 2 starts at 12:30
     if dtime(8, 52) <= n.time() < dtime(12, 25):
         end = datetime(n.year, n.month, n.day, 12, 25, tzinfo=IST)
     elif dtime(12, 30) <= n.time() < dtime(15, 17):
