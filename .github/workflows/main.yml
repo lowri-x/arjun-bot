@@ -8,7 +8,9 @@ on:
 
 jobs:
   run-bot:
-    runs-on: ubuntu-latest
+    # ubuntu-latest now points to Ubuntu 26.04, which does not support Python 3.9.
+    # Pinning to ubuntu-24.04 ensures Python 3.9 remains available.
+    runs-on: ubuntu-24.04
     timeout-minutes: 400 # Max 6 hours 40 mins (Covers full market)
     
     steps:
@@ -18,7 +20,7 @@ jobs:
       - name: Setup Python
         uses: actions/setup-python@v4
         with:
-          python-version: '3.9'
+          python-version: '3.9' # Now this will work on ubuntu-24.04
 
       - name: Install Dependencies
         run: pip install -r requirements.txt
