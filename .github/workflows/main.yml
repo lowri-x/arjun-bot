@@ -1,36 +1,23 @@
-name: Arjun Live Signal Bot
+# config.py
+import os
 
-on:
-  schedule:
-    # 03:15 AM UTC is 08:45 AM IST (Start 15 mins early to avoid GitHub delay)
-    - cron: '15 3 * * 1-5' 
-  workflow_dispatch: # To run manually
+# Angel One Credentials
+API_KEY = os.getenv('ANGEL_API_KEY', 'YOUR_API_KEY')
+CLIENT_ID = os.getenv('ANGEL_CLIENT_ID', 'YOUR_CLIENT_ID')
+PIN = os.getenv('ANGEL_PIN', 'YOUR_PIN')
+TOTP_SECRET = os.getenv('ANGEL_TOTP_SECRET', 'YOUR_TOTP_SECRET')
 
-jobs:
-  run-bot:
-    # ubuntu-latest now points to Ubuntu 26.04, which does not support Python 3.9.
-    # Pinning to ubuntu-24.04 ensures Python 3.9 remains available.
-    runs-on: ubuntu-24.04
-    timeout-minutes: 400 # Max 6 hours 40 mins (Covers full market)
-    
-    steps:
-      - name: Checkout Code
-        uses: actions/checkout@v3
+# Telegram Credentials
+TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN', 'YOUR_BOT_TOKEN')
+TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID', 'YOUR_CHAT_ID')
 
-      - name: Setup Python
-        uses: actions/setup-python@v4
-        with:
-          python-version: '3.9' # Now this will work on ubuntu-24.04
+# Strategy Parameters (S&R Breakout / Fake Breakout)
+LOOKBACK_PERIOD = 20      # ਪਿਛਲੇ 20 ਕੈਂਡਲਾਂ ਦਾ ਹਾਈ/ਲੋ ਦੇਖਣਾ ਹੈ
+VOLUME_MULTIPLIER = 1.5   # ਵਾਲੀਅਮ ਆਮ ਨਾਲੋਂ 1.5 ਗੁਣਾ ਜ਼ਿਆਦਾ ਹੋਣਾ ਚਾਹੀਦਾ ਹੈ
 
-      - name: Install Dependencies
-        run: pip install -r requirements.txt
-
-      - name: Run Live Engine
-        env:
-          ANGEL_API_KEY: ${{ secrets.ANGEL_API_KEY }}
-          ANGEL_CLIENT_ID: ${{ secrets.ANGEL_CLIENT_ID }}
-          ANGEL_PIN: ${{ secrets.ANGEL_PIN }}
-          ANGEL_TOTP_SECRET: ${{ secrets.ANGEL_TOTP_SECRET }}
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: python live_feed.py
+# Indices to Track (Nifty 50 & Bank Nifty Spot Tokens)
+# ਐਂਜਲ ਵਨ ਵਿੱਚ ਇੰਡੈਕਸ ਲਈ ਇਹ ਟੋਕਨ ਵਰਤੇ ਜਾਂਦੇ ਹਨ
+INDICES_TO_TRACK = {
+    "NIFTY": "99926000", 
+    "BANKNIFTY": "99926009"
+}
