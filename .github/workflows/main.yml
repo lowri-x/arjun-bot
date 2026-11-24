@@ -1,23 +1,35 @@
-# config.py
-import os
+name: Arjun V2.0 Live Bot
 
-# Angel One Credentials
-API_KEY = os.getenv('ANGEL_API_KEY', 'YOUR_API_KEY')
-CLIENT_ID = os.getenv('ANGEL_CLIENT_ID', 'YOUR_CLIENT_ID')
-PIN = os.getenv('ANGEL_PIN', 'YOUR_PIN')
-TOTP_SECRET = os.getenv('ANGEL_TOTP_SECRET', 'YOUR_TOTP_SECRET')
+on:
+  schedule:
+    # 9:10 AM IST (03:40 UTC)
+    - cron: '40 3 * * 1-5' 
+  workflow_dispatch: 
 
-# Telegram Credentials
-TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN', 'YOUR_BOT_TOKEN')
-TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID', 'YOUR_CHAT_ID')
+jobs:
+  run-bot:
+    runs-on: ubuntu-24.04
+    # 355 ਮਿੰਟ (GitHub ਦੀ 360 ਮਿੰਟ ਦੀ ਹੱਦ ਤੋਂ ਘੱਟ)
+    timeout-minutes: 355 
+    
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
 
-# Strategy Parameters (S&R Breakout / Fake Breakout)
-LOOKBACK_PERIOD = 20      # ਪਿਛਲੇ 20 ਕੈਂਡਲਾਂ ਦਾ ਹਾਈ/ਲੋ ਦੇਖਣਾ ਹੈ
-VOLUME_MULTIPLIER = 1.5   # ਵਾਲੀਅਮ ਆਮ ਨਾਲੋਂ 1.5 ਗੁਣਾ ਜ਼ਿਆਦਾ ਹੋਣਾ ਚਾਹੀਦਾ ਹੈ
+      - name: Setup Python 3.9
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.9'
 
-# Indices to Track (Nifty 50 & Bank Nifty Spot Tokens)
-# ਐਂਜਲ ਵਨ ਵਿੱਚ ਇੰਡੈਕਸ ਲਈ ਇਹ ਟੋਕਨ ਵਰਤੇ ਜਾਂਦੇ ਹਨ
-INDICES_TO_TRACK = {
-    "NIFTY": "99926000", 
-    "BANKNIFTY": "99926009"
-}
+      - name: Install Dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run Arjun Bot
+        env:
+          ANGEL_API_KEY: ${{ secrets.ANGEL_API_KEY }}
+          ANGEL_CLIENT_ID: ${{ secrets.ANGEL_CLIENT_ID }}
+          ANGEL_PIN: ${{ secrets.ANGEL_PIN }}
+          ANGEL_TOTP_SECRET: ${{ secrets.ANGEL_TOTP_SECRET }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python main.py
