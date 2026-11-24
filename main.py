@@ -84,7 +84,6 @@ class ArjunV2Engine:
                             }
                     
                     sorted_keys = sorted(temp_candles.keys())
-                    # FIX 3: 30 ਦੀ ਬਜਾਏ 60 ਕੈਂਡਲ ਰੱਖੋ
                     self.candles[token] = {k: temp_candles[k] for k in sorted_keys[-60:]}
                     
                     if len(self.candles[token]) >= LOOKBACK_PERIOD + ATR_PERIOD:
@@ -201,13 +200,11 @@ class ArjunV2Engine:
         if not self.is_ready[token]: return
         symbol = self.token_to_symbol[token]
 
-        # FIX 1: ਮੌਜੂਦਾ ਕੈਂਡਲ ਨੂੰ ਲਿਸਟ ਵਿੱਚੋਂ ਬਾਹਰ ਕੱਢਣਾ
         past_keys = [k for k in sorted(self.candles[token].keys()) if k < candle['time']]
         if len(past_keys) < LOOKBACK_PERIOD + ATR_PERIOD: return
 
         recent_candles = [self.candles[token][k] for k in past_keys[-(ATR_PERIOD + 1):]]
         
-        # ATR ਲਾਜਿਕ
         tr_values = [
             max(
                 recent_candles[i]['high'] - recent_candles[i]['low'],
@@ -225,7 +222,6 @@ class ArjunV2Engine:
         curr_close = candle['close']
         signal, sl, target = None, 0, 0
 
-        # FIX 2: Volume ਫਿਲਟਰ ਹਟਾ ਦਿੱਤਾ ਗਿਆ
         if curr_close > resistance:
             signal = "🟢 CONFIRMED BREAKOUT (BUY CE)"
             sl = curr_close - (atr * ATR_MULTIPLIER)
@@ -245,7 +241,6 @@ class ArjunV2Engine:
             send_telegram_alert(msg)
 
     def market_close_monitor(self):
-        """ਬੈਕਗਰਾਊਂਡ ਥ੍ਰੈਡ: 3:00 PM 'ਤੇ ਵੈਬਸਾਕੇਟ ਬੰਦ ਕਰਨ ਲਈ"""
         while True:
             if datetime.now(IST).time() >= datetime.strptime("15:00", "%H:%M").time():
                 logging.info("🔔 3:00 PM reached. Closing WebSocket gracefully.")
