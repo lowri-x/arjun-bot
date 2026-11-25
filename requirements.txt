@@ -4,3 +4,4 @@ pyotp
 requests
 pytz
 logzero
+pandas
