@@ -65,15 +65,12 @@ class ArjunV2Engine:
         return False
 
     def load_scrip_master(self):
-        """ਆਪਸ਼ਨ ਟੋਕਨ ਲੱਭਣ ਲਈ ਸਕ੍ਰਿਪ ਮਾਸਟਰ ਡਾਊਨਲੋਡ ਅਤੇ ਸਾਫ਼ ਕਰਨਾ"""
         logging.info("📥 Downloading Scrip Master for Option Tokens...")
         try:
             url = "https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json"
             df = pd.read_json(url)
             df = df[(df['name'].isin(['NIFTY', 'BANKNIFTY'])) & (df['instrumenttype'] == 'OPTIDX')].copy()
-            # Angel One ਵਿੱਚ strike 100 ਨਾਲ ਗੁਣਾ ਹੁੰਦੀ ਹੈ
             df['strike_num'] = pd.to_numeric(df['strike'], errors='coerce') / 100.0
-            # Expiry ਤਾਰੀਖ਼ ਨੂੰ ਸਹੀ Date ਵਿੱਚ ਬਦਲੋ
             df['expiry_dt'] = pd.to_datetime(df['expiry'], format='%d%b%Y', errors='coerce')
             self.scrip_master = df.dropna(subset=['strike_num', 'expiry_dt'])
             logging.info(f"✅ Scrip Master Loaded ({len(self.scrip_master)} contracts).")
@@ -81,7 +78,6 @@ class ArjunV2Engine:
             logging.error(f"❌ Error loading Scrip Master: {e}")
 
     def get_atm_option(self, symbol, spot_price, option_type):
-        """ਸਭ ਤੋਂ ਨਜ਼ਦੀਕੀ Expiry ਅਤੇ ATM Strike ਦਾ ਲਾਈਵ ਪ੍ਰੀਮੀਅਮ ਲੈਣਾ"""
         if self.scrip_master is None:
             return None, 0
 
@@ -236,12 +232,15 @@ class ArjunV2Engine:
         curr_close = candle['close']
         signal, spot_sl, option_type = None, 0, None
 
+        # 🟢 ਬਦਲਾਅ: ਹਰੇ ਰੰਗ ਦਾ ਸਿਗਨਲ CE ਲਈ
         if curr_close > resistance:
-            signal = "🟢 CONFIRMED BREAKOUT (BUY CE)"
+            signal = "🟢 GREEN BUY CALL (CE) 🟢"
             spot_sl = curr_close - (atr * ATR_MULTIPLIER)
             option_type = "CE"
+            
+        # 🔴 ਬਦਲਾਅ: ਲਾਲ ਰੰਗ ਦਾ ਸਿਗਨਲ PE ਲਈ
         elif curr_close < support:
-            signal = "🔴 CONFIRMED BREAKDOWN (BUY PE)"
+            signal = "🔴 RED BUY PUT (PE) 🔴"
             spot_sl = curr_close + (atr * ATR_MULTIPLIER)
             option_type = "PE"
 
@@ -267,8 +266,6 @@ class ArjunV2Engine:
                     sl_pts, tgt_pts = BANKNIFTY_SL_POINTS, BANKNIFTY_TGT_POINTS
 
                 opt_target = premium + tgt_pts
-                
-                # Expiry 'ਤੇ SL ਨੂੰ ਮਾਈਨਸ (-) ਹੋਣ ਤੋਂ ਰੋਕਣ ਲਈ max(1.0, ...) ਦੀ ਵਰਤੋਂ
                 opt_sl = max(1.0, premium - sl_pts) 
                 
                 msg += (f"<b>--- OPTION PREMIUM ---</b>\n"
@@ -312,7 +309,7 @@ class ArjunV2Engine:
             if self.login(): self.fetch_historical_data()
 
 if __name__ == "__main__":
-    send_telegram_alert("✅ <b>ARJUN V2.1 STARTED (Premium Fix + Cooldown)</b>")
+    send_telegram_alert("✅ <b>ARJUN V2.1 STARTED (Color-Coded Signals)</b>")
     engine = ArjunV2Engine()
     try: engine.start()
     except KeyboardInterrupt: send_telegram_alert("🛑 <b>Bot STOPPED</b>")
