@@ -43,13 +43,10 @@ class ArjunV2Engine:
         self.last_early_alert_time = {token: None for token in INDICES_TO_TRACK.values()} 
         self.last_tick_time = {token: None for token in INDICES_TO_TRACK.values()}
         
-        # ਸਿਗਨਲ ਕੂਲਡਾਊਨ ਲਈ
         self.last_signal_time_ce = {token: None for token in INDICES_TO_TRACK.values()}
         self.last_signal_time_pe = {token: None for token in INDICES_TO_TRACK.values()}
 
         self.token_list = [{"exchangeType": 1, "tokens": list(INDICES_TO_TRACK.values())}]
-        
-        # ਸਕ੍ਰਿਪ ਮਾਸਟਰ (ਆਪਸ਼ਨ ਟੋਕਨ ਲੱਭਣ ਲਈ)
         self.scrip_master = None
 
     def login(self):
@@ -68,61 +65,48 @@ class ArjunV2Engine:
         return False
 
     def load_scrip_master(self):
-        """ਆਪਸ਼ਨ ਟੋਕਨ ਲੱਭਣ ਲਈ ਸਕ੍ਰਿਪ ਮਾਸਟਰ ਡਾਊਨਲੋਡ ਕਰਨਾ"""
+        """ਆਪਸ਼ਨ ਟੋਕਨ ਲੱਭਣ ਲਈ ਸਕ੍ਰਿਪ ਮਾਸਟਰ ਡਾਊਨਲੋਡ ਅਤੇ ਸਾਫ਼ ਕਰਨਾ"""
         logging.info("📥 Downloading Scrip Master for Option Tokens...")
         try:
             url = "https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json"
             df = pd.read_json(url)
-            # ਸਿਰਫ਼ ਨਿਫਟੀ ਅਤੇ ਬੈਂਕ ਨਿਫਟੀ ਦੇ ਆਪਸ਼ਨ ਰੱਖੋ
-            df = df[df['name'].isin(['NIFTY', 'BANKNIFTY'])]
-            df = df[df['instrumenttype'] == 'OPTIDX']
-            self.scrip_master = df
-            logging.info("✅ Scrip Master Loaded.")
+            df = df[(df['name'].isin(['NIFTY', 'BANKNIFTY'])) & (df['instrumenttype'] == 'OPTIDX')].copy()
+            # Angel One ਵਿੱਚ strike 100 ਨਾਲ ਗੁਣਾ ਹੁੰਦੀ ਹੈ
+            df['strike_num'] = pd.to_numeric(df['strike'], errors='coerce') / 100.0
+            # Expiry ਤਾਰੀਖ਼ ਨੂੰ ਸਹੀ Date ਵਿੱਚ ਬਦਲੋ
+            df['expiry_dt'] = pd.to_datetime(df['expiry'], format='%d%b%Y', errors='coerce')
+            self.scrip_master = df.dropna(subset=['strike_num', 'expiry_dt'])
+            logging.info(f"✅ Scrip Master Loaded ({len(self.scrip_master)} contracts).")
         except Exception as e:
             logging.error(f"❌ Error loading Scrip Master: {e}")
 
     def get_atm_option(self, symbol, spot_price, option_type):
-        """ਸਪਾਟ ਦੀ ਕੀਮਤ ਨਾਲ ਏਟੀਐਮ (ATM) ਸਟ੍ਰਾਈਕ ਅਤੇ ਟੋਕਨ ਲੱਭਣਾ"""
+        """ਸਭ ਤੋਂ ਨਜ਼ਦੀਕੀ Expiry ਅਤੇ ATM Strike ਦਾ ਲਾਈਵ ਪ੍ਰੀਮੀਅਮ ਲੈਣਾ"""
         if self.scrip_master is None:
             return None, 0
 
-        # ਨਿਫਟੀ ਲਈ 50 ਅਤੇ ਬੈਂਕ ਨਿਫਟੀ ਲਈ 100 ਦੇ ਹਿਸਾਬ ਨਾਲ ਸਟ੍ਰਾਈਕ ਰਾਊਂਡ ਕਰੋ
         strike_round = 50 if symbol == 'NIFTY' else 100
         atm_strike = round(spot_price / strike_round) * strike_round
-        
-        # ਅੱਜ ਦੀ ਤਾਰੀਖ਼ ਦੇ ਹਿਸਾਬ ਨਾਲ ਸਭ ਤੋਂ ਨਜ਼ਦੀਕੀ ਐਕਸਪਾਈਰੀ ਲੱਭੋ
-        today = datetime.now(IST).strftime('%d%b%Y').upper()
-        
-        # ਫਿਲਟਰ ਕਰੋ
+        today_date = pd.Timestamp(datetime.now(IST).date())
+
         filtered = self.scrip_master[
-            (self.scrip_master['name'] == symbol) & 
-            (self.scrip_master['strike'] == str(float(atm_strike))) & 
-            (self.scrip_master['symbol'].str.endswith(option_type))
-        ]
-        
-        # ਜੇਕਰ ਅੱਜ ਦੀ ਐਕਸਪਾਈਰੀ ਨਾ ਮਿਲੇ ਤਾਂ ਸਭ ਤੋਂ ਪਹਿਲੀ ਉਪਲਬਧ ਲਵੋ (Weekly)
-        if filtered.empty:
-            filtered = self.scrip_master[
-                (self.scrip_master['name'] == symbol) & 
-                (self.scrip_master['strike'] == str(float(atm_strike))) & 
-                (self.scrip_master['symbol'].str.endswith(option_type))
-            ].head(1)
-            
+            (self.scrip_master['name'] == symbol) &
+            (self.scrip_master['strike_num'] == float(atm_strike)) &
+            (self.scrip_master['symbol'].str.endswith(option_type)) &
+            (self.scrip_master['expiry_dt'] >= today_date)
+        ].sort_values('expiry_dt')
+
         if not filtered.empty:
-            token = filtered.iloc[0]['token']
-            symbol_name = filtered.iloc[0]['symbol']
-            
-            # ਲਾਈਵ ਪ੍ਰੀਮੀਅਮ ਲਵੋ
+            row = filtered.iloc[0]
             try:
-                ltp_data = self.smart_obj.ltpData("NFO", symbol_name, token)
-                premium = ltp_data['data']['ltp']
-                return premium, atm_strike
-            except:
-                pass
-                
+                ltp_data = self.smart_obj.ltpData("NFO", str(row['symbol']), str(row['token']))
+                if ltp_data and ltp_data.get('status'):
+                    return float(ltp_data['data']['ltp']), atm_strike
+            except Exception as e:
+                logging.error(f"LTP Fetch Error ({row['symbol']}): {e}")
+
         return None, atm_strike
 
-    # ... (fetch_historical_data, init_websocket, on_open, on_error, on_close ਉਹੀ ਰਹਿਣਗੇ) ...
     def fetch_historical_data(self):
         logging.info("📥 Fetching historical data...")
         now = datetime.now(IST)
@@ -262,32 +246,36 @@ class ArjunV2Engine:
             option_type = "PE"
 
         if signal:
-            # 🛑 ਸਿਗਨਲ ਕੂਲਡਾਊਨ ਚੈੱਕ (1 ਘੰਟੇ ਦਾ)
             last_time = self.last_signal_time_ce[token] if option_type == "CE" else self.last_signal_time_pe[token]
             if last_time and (datetime.now(IST) - last_time).total_seconds() < SIGNAL_COOLDOWN:
-                return # ਜੇ 1 ਘੰਟਾ ਨਹੀਂ ਹੋਇਆ, ਤਾਂ ਨਵਾਂ ਸਿਗਨਲ ਨਾ ਭੇਜੋ
+                return 
 
-            # ਆਪਸ਼ਨ ਦਾ ਲਾਈਵ ਪ੍ਰੀਮੀਅਮ ਲੱਭੋ
             premium, atm_strike = self.get_atm_option(symbol, curr_close, option_type)
             
-            # ਅਪਡੇਟ ਕੂਲਡਾਊਨ ਟਾਈਮ
             if option_type == "CE": self.last_signal_time_ce[token] = datetime.now(IST)
             else: self.last_signal_time_pe[token] = datetime.now(IST)
 
             self.last_final_alert_time[token] = candle['time']
             
-            # ਮੈਸੇਜ ਤਿਆਰ ਕਰੋ
             msg = f"🚨 <b>{signal}</b> 🚨\nIndex: <b>{symbol}</b> | Time: {candle['time'].strftime('%H:%M')}\n\n"
             msg += f"<b>--- SPOT INDEX ---</b>\nSpot Close: {curr_close:.2f}\nSpot SL: {spot_sl:.2f}\n\n"
             
             if premium:
-                opt_target = premium + OPTION_TARGET_POINTS
-                opt_sl = premium - OPTION_SL_POINTS
+                if symbol == 'NIFTY':
+                    sl_pts, tgt_pts = NIFTY_SL_POINTS, NIFTY_TGT_POINTS
+                else:
+                    sl_pts, tgt_pts = BANKNIFTY_SL_POINTS, BANKNIFTY_TGT_POINTS
+
+                opt_target = premium + tgt_pts
+                
+                # Expiry 'ਤੇ SL ਨੂੰ ਮਾਈਨਸ (-) ਹੋਣ ਤੋਂ ਰੋਕਣ ਲਈ max(1.0, ...) ਦੀ ਵਰਤੋਂ
+                opt_sl = max(1.0, premium - sl_pts) 
+                
                 msg += (f"<b>--- OPTION PREMIUM ---</b>\n"
                         f"ATM Strike: {atm_strike} {option_type}\n"
                         f"Est. Premium: ₹{premium:.2f}\n"
-                        f"<b>Option Target: ₹{opt_target:.2f}</b> (+{OPTION_TARGET_POINTS})\n"
-                        f"<b>Option SL: ₹{opt_sl:.2f}</b> (-{OPTION_SL_POINTS})\n\n")
+                        f"<b>Option Target: ₹{opt_target:.2f}</b> (+{tgt_pts})\n"
+                        f"<b>Option SL: ₹{opt_sl:.2f}</b> (-{sl_pts})\n\n")
             else:
                 msg += f"<i>(Option premium data unavailable. Trade manually based on spot.)</i>\n\n"
                 
@@ -297,7 +285,7 @@ class ArjunV2Engine:
     def market_close_monitor(self):
         while True:
             if datetime.now(IST).time() >= datetime.strptime("15:00", "%H:%M").time():
-                send_telegram_alert("🔔 <b>ARJUN V2.0: Market Closed (3:00 PM). Shutting down.</b>")
+                send_telegram_alert("🔔 <b>ARJUN V2.1: Market Closed (3:00 PM). Shutting down.</b>")
                 if self.sws:
                     try: self.sws.close_connection()
                     except: pass
@@ -307,7 +295,7 @@ class ArjunV2Engine:
     def start(self):
         while not self.login(): time.sleep(10)
         
-        self.load_scrip_master() # ਆਪਸ਼ਨ ਟੋਕਨ ਲਈ
+        self.load_scrip_master() 
         self.fetch_historical_data()
 
         threading.Thread(target=self.market_close_monitor, daemon=True).start()
@@ -324,7 +312,7 @@ class ArjunV2Engine:
             if self.login(): self.fetch_historical_data()
 
 if __name__ == "__main__":
-    send_telegram_alert("✅ <b>ARJUN V2.1 STARTED (Premium Levels + Cooldown)</b>")
+    send_telegram_alert("✅ <b>ARJUN V2.1 STARTED (Premium Fix + Cooldown)</b>")
     engine = ArjunV2Engine()
     try: engine.start()
     except KeyboardInterrupt: send_telegram_alert("🛑 <b>Bot STOPPED</b>")
