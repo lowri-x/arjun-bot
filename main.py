@@ -64,6 +64,100 @@ class ArjunV2Engine:
             logging.error(f"❌ Login Failed: {e}")
         return False
 
+    def _fetch_yahoo_chg(self, ticker):
+        """Yahoo Finance ਤੋਂ ਗਲੋਬਲ ਡੇਟਾ ਲਿਆਉਣ ਲਈ (FIX: chartPreviousClose fallback)"""
+        try:
+            url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}?range=5d&interval=1d"
+            headers = {'User-Agent': 'Mozilla/5.0'}
+            res = requests.get(url, headers=headers, timeout=5)
+            data = res.json()
+            meta = data['chart']['result'][0]['meta']
+            
+            price = meta['regularMarketPrice']
+            # ਸੁਰੱਖਿਆ ਲਈ ਦੋਵੇਂ ਚੈੱਕ ਕਰੋ
+            prev_close = meta.get('chartPreviousClose') or meta.get('previousClose')
+            
+            if prev_close is None:
+                return price, 0.0
+                
+            chg_pct = ((price - prev_close) / prev_close) * 100
+            return price, chg_pct
+        except Exception as e:
+            logging.error(f"Error fetching {ticker}: {e}")
+            return None, None
+
+    def send_morning_mood_summary(self):
+        """ਸਵੇਰੇ 09:10 AM 'ਤੇ ਗ੍ਰਾਫਿਕਲ Global Cues + India VIX ਕਾਰਡ ਭੇਜਣਾ"""
+        now_str = datetime.now(IST).strftime("%d %b %Y • %I:%M %p")
+        score = 0
+        global_lines = []
+
+        # 1. India VIX (Angel One SmartAPI ਰਾਹੀਂ)
+        vix_block = "⚪ <b>India VIX:</b> <i>Unavailable</i>"
+        try:
+            vix_res = self.smart_obj.ltpData("NSE", "INDIA VIX", "99926017")
+            if vix_res and vix_res.get("status"):
+                vix = float(vix_res["data"]["ltp"])
+                if vix < 14:
+                    vix_badge, vix_bar, vix_tip = "🟢 CALM", "🟩⬜⬜⬜⬜", "Slow moves, avoid wide targets"
+                elif vix <= 22:
+                    vix_badge, vix_bar, vix_tip = "🟡 OPTIMAL", "🟨🟨🟨⬜⬜", "Healthy trend &amp; momentum"
+                else:
+                    vix_badge, vix_bar, vix_tip = "🔴 HIGH RISK", "🟥🟥🟥🟥🟥", "Sharp spikes, tighten qty"
+                
+                vix_block = (
+                    f"⚡ <b>India VIX:</b> <code>{vix:.2f}</code> {vix_badge}\n"
+                    f" {vix_bar} <i>({vix_tip})</i>"
+                )
+        except Exception:
+            pass
+
+        # 2. Global Markets & Currency
+        assets = [
+            ("🇺🇸 S&amp;P 500", "^GSPC", False),
+            ("💻 Nasdaq", "^IXIC", False),
+            ("🛢️ Brent Crude", "BZ=F", True),   # Crude ਵਧਣਾ ਭਾਰਤ ਲਈ ਨੈਗੇਟਿਵ
+            ("💵 USD / INR", "INR=X", True),    # ਰੁਪਿਆ ਕਮਜ਼ੋਰ ਹੋਣਾ ਨੈਗੇਟਿਵ
+        ]
+
+        for label, ticker, invert in assets:
+            price, chg = self._fetch_yahoo_chg(ticker)
+            if price is not None:
+                is_good = (chg <= 0) if invert else (chg >= 0)
+                dot = "🟢" if is_good else "🔴"
+                arrow = "📈" if chg >= 0 else "📉"
+                score += 1 if is_good else -1
+                global_lines.append(
+                    f"{dot} <b>{label}:</b> <code>{price:,.2f}</code> {arrow} <b>{chg:+.2f}%</b>"
+                )
+
+        # 3. Overall Mood Meter Bar
+        if score >= 2:
+            mood_text = "🟢 <b>BULLISH BIAS</b> <code>[🟩🟩🟩🟩⬜]</code>"
+        elif score <= -2:
+            mood_text = "🔴 <b>BEARISH BIAS</b> <code>[🟥🟥🟥🟥⬜]</code>"
+        else:
+            mood_text = "🟡 <b>MIXED / NEUTRAL</b> <code>[🟨🟨🟨⬜⬜]</code>"
+
+        global_section = "\n".join(global_lines) if global_lines else "⚪ <i>Global data unavailable</i>"
+
+        msg = (
+            f"🌅 <b>ARJUN V2.1 • PRE-MARKET PULSE</b>\n"
+            f"📅 <i>{now_str} IST</i>\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"🧭 <b>Market Mood:</b> {mood_text}\n\n"
+            f"📊 <b>VOLATILITY RADAR</b>\n"
+            f"{vix_block}\n\n"
+            f"🌍 <b>GLOBAL &amp; MACRO CUES</b>\n"
+            f"{global_section}\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"🛡️ <b>Active Guardrails:</b>\n"
+            f"• ⏳ Gap Skip: <code>09:15–09:30</code> | Chop Skip: <code>11:30–13:00</code>\n"
+            f"• 🎯 NIFTY: <code>SL -25 / TGT +40</code> | BNF: <code>SL -60 / TGT +90</code>\n"
+            f"🚀 <i>Live signals begin at 09:30 AM IST.</i>"
+        )
+        send_telegram_alert(msg)
+
     def load_scrip_master(self):
         logging.info("📥 Downloading Scrip Master for Option Tokens...")
         try:
@@ -232,13 +326,10 @@ class ArjunV2Engine:
         curr_close = candle['close']
         signal, spot_sl, option_type = None, 0, None
 
-        # 🟢 ਬਦਲਾਅ: ਹਰੇ ਰੰਗ ਦਾ ਸਿਗਨਲ CE ਲਈ
         if curr_close > resistance:
             signal = "🟢 GREEN BUY CALL (CE) 🟢"
             spot_sl = curr_close - (atr * ATR_MULTIPLIER)
             option_type = "CE"
-            
-        # 🔴 ਬਦਲਾਅ: ਲਾਲ ਰੰਗ ਦਾ ਸਿਗਨਲ PE ਲਈ
         elif curr_close < support:
             signal = "🔴 RED BUY PUT (PE) 🔴"
             spot_sl = curr_close + (atr * ATR_MULTIPLIER)
@@ -292,6 +383,9 @@ class ArjunV2Engine:
     def start(self):
         while not self.login(): time.sleep(10)
         
+        # 1. ਸਵੇਰ ਦਾ ਮੂਡ ਕਾਰਡ ਭੇਜੋ
+        self.send_morning_mood_summary()
+        
         self.load_scrip_master() 
         self.fetch_historical_data()
 
@@ -309,7 +403,7 @@ class ArjunV2Engine:
             if self.login(): self.fetch_historical_data()
 
 if __name__ == "__main__":
-    send_telegram_alert("✅ <b>ARJUN V2.1 STARTED (Color-Coded Signals)</b>")
+    send_telegram_alert("✅ <b>ARJUN V2.1 Engine Starting...</b>")
     engine = ArjunV2Engine()
     try: engine.start()
     except KeyboardInterrupt: send_telegram_alert("🛑 <b>Bot STOPPED</b>")
