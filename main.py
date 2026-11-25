@@ -13,6 +13,7 @@ from config import *
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 IST = pytz.timezone('Asia/Kolkata')
 
+
 def send_telegram_alert(message):
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "HTML"}
@@ -26,6 +27,7 @@ def send_telegram_alert(message):
         time.sleep(2)
     return False
 
+
 class ArjunV2Engine:
     def __init__(self):
         self.smart_obj = None
@@ -33,16 +35,16 @@ class ArjunV2Engine:
         self.jwt_token = None
         self.refresh_token = None
         self.feed_token = None
-        
+
         self.token_to_symbol = {v: k for k, v in INDICES_TO_TRACK.items()}
-        self.candles = {token: {} for token in INDICES_TO_TRACK.values()} 
+        self.candles = {token: {} for token in INDICES_TO_TRACK.values()}
         self.current_candle = {token: None for token in INDICES_TO_TRACK.values()}
         self.is_ready = {token: False for token in INDICES_TO_TRACK.values()}
-        
+
         self.last_final_alert_time = {token: None for token in INDICES_TO_TRACK.values()}
-        self.last_early_alert_time = {token: None for token in INDICES_TO_TRACK.values()} 
+        self.last_early_alert_time = {token: None for token in INDICES_TO_TRACK.values()}
         self.last_tick_time = {token: None for token in INDICES_TO_TRACK.values()}
-        
+
         self.last_signal_time_ce = {token: None for token in INDICES_TO_TRACK.values()}
         self.last_signal_time_pe = {token: None for token in INDICES_TO_TRACK.values()}
 
@@ -65,21 +67,19 @@ class ArjunV2Engine:
         return False
 
     def _fetch_yahoo_chg(self, ticker):
-        """Yahoo Finance ਤੋਂ ਗਲੋਬਲ ਡੇਟਾ ਲਿਆਉਣ ਲਈ (FIX: chartPreviousClose fallback)"""
         try:
             url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}?range=5d&interval=1d"
             headers = {'User-Agent': 'Mozilla/5.0'}
             res = requests.get(url, headers=headers, timeout=5)
             data = res.json()
             meta = data['chart']['result'][0]['meta']
-            
+
             price = meta['regularMarketPrice']
-            # ਸੁਰੱਖਿਆ ਲਈ ਦੋਵੇਂ ਚੈੱਕ ਕਰੋ
             prev_close = meta.get('chartPreviousClose') or meta.get('previousClose')
-            
+
             if prev_close is None:
                 return price, 0.0
-                
+
             chg_pct = ((price - prev_close) / prev_close) * 100
             return price, chg_pct
         except Exception as e:
@@ -87,12 +87,10 @@ class ArjunV2Engine:
             return None, None
 
     def send_morning_mood_summary(self):
-        """ਸਵੇਰੇ 09:10 AM 'ਤੇ ਗ੍ਰਾਫਿਕਲ Global Cues + India VIX ਕਾਰਡ ਭੇਜਣਾ"""
         now_str = datetime.now(IST).strftime("%d %b %Y • %I:%M %p")
         score = 0
         global_lines = []
 
-        # 1. India VIX (Angel One SmartAPI ਰਾਹੀਂ)
         vix_block = "⚪ <b>India VIX:</b> <i>Unavailable</i>"
         try:
             vix_res = self.smart_obj.ltpData("NSE", "INDIA VIX", "99926017")
@@ -104,7 +102,7 @@ class ArjunV2Engine:
                     vix_badge, vix_bar, vix_tip = "🟡 OPTIMAL", "🟨🟨🟨⬜⬜", "Healthy trend &amp; momentum"
                 else:
                     vix_badge, vix_bar, vix_tip = "🔴 HIGH RISK", "🟥🟥🟥🟥🟥", "Sharp spikes, tighten qty"
-                
+
                 vix_block = (
                     f"⚡ <b>India VIX:</b> <code>{vix:.2f}</code> {vix_badge}\n"
                     f" {vix_bar} <i>({vix_tip})</i>"
@@ -112,12 +110,11 @@ class ArjunV2Engine:
         except Exception:
             pass
 
-        # 2. Global Markets & Currency
         assets = [
             ("🇺🇸 S&amp;P 500", "^GSPC", False),
             ("💻 Nasdaq", "^IXIC", False),
-            ("🛢️ Brent Crude", "BZ=F", True),   # Crude ਵਧਣਾ ਭਾਰਤ ਲਈ ਨੈਗੇਟਿਵ
-            ("💵 USD / INR", "INR=X", True),    # ਰੁਪਿਆ ਕਮਜ਼ੋਰ ਹੋਣਾ ਨੈਗੇਟਿਵ
+            ("🛢️ Brent Crude", "BZ=F", True),
+            ("💵 USD / INR", "INR=X", True),
         ]
 
         for label, ticker, invert in assets:
@@ -131,7 +128,6 @@ class ArjunV2Engine:
                     f"{dot} <b>{label}:</b> <code>{price:,.2f}</code> {arrow} <b>{chg:+.2f}%</b>"
                 )
 
-        # 3. Overall Mood Meter Bar
         if score >= 2:
             mood_text = "🟢 <b>BULLISH BIAS</b> <code>[🟩🟩🟩🟩⬜]</code>"
         elif score <= -2:
@@ -222,8 +218,10 @@ class ArjunV2Engine:
 
     def init_websocket(self):
         if self.sws:
-            try: self.sws.close_connection()
-            except: pass
+            try:
+                self.sws.close_connection()
+            except Exception:
+                pass
         self.sws = SmartWebSocketV2(self.jwt_token, API_KEY, CLIENT_ID, self.feed_token)
         self.sws.on_open = self.on_open
         self.sws.on_data = self.on_data
@@ -234,24 +232,33 @@ class ArjunV2Engine:
         logging.info("🔌 WebSocket CONNECTED.")
         self.sws.subscribe("arjun_v2", 1, self.token_list)
 
-    def on_error(self, wsapp, error): logging.error(f"⚠️ WS ERROR: {error}")
-    def on_close(self, wsapp): logging.warning("🔌 WS DISCONNECTED.")
+    def on_error(self, wsapp, error):
+        logging.error(f"⚠️ WS ERROR: {error}")
+
+    def on_close(self, wsapp):
+        logging.warning("🔌 WS DISCONNECTED.")
 
     def is_trade_allowed_time(self, current_time):
         t = current_time.time()
-        if SKIP_GAP_TIME and t < datetime.strptime("09:30", "%H:%M").time(): return False
-        if SKIP_LUNCH_CHOP and (datetime.strptime("11:30", "%H:%M").time() <= t < datetime.strptime("13:00", "%H:%M").time()): return False
-        if t >= datetime.strptime("14:45", "%H:%M").time(): return False
+        if SKIP_GAP_TIME and t < datetime.strptime("09:30", "%H:%M").time():
+            return False
+        if SKIP_LUNCH_CHOP and (datetime.strptime("11:30", "%H:%M").time() <= t < datetime.strptime("13:00", "%H:%M").time()):
+            return False
+        if t >= datetime.strptime("14:45", "%H:%M").time():
+            return False
         return True
 
     def on_data(self, wsapp, message):
         try:
-            if 'last_traded_price' not in message: return
+            if 'last_traded_price' not in message:
+                return
             token = str(message['token'])
-            if token not in self.token_to_symbol: return
+            if token not in self.token_to_symbol:
+                return
 
             exchange_ts = message.get('exchange_timestamp')
-            if not exchange_ts or not isinstance(exchange_ts, (int, float)): return
+            if not exchange_ts or not isinstance(exchange_ts, (int, float)):
+                return
 
             dt_object = datetime.fromtimestamp(exchange_ts / 1000.0, tz=IST)
             ltp = message['last_traded_price'] / 100.0
@@ -285,17 +292,20 @@ class ArjunV2Engine:
             logging.error(f"Data Error: {e}")
 
     def check_early_breakout(self, token, current_ltp, candle_time):
-        if not self.is_ready[token]: return
+        if not self.is_ready[token]:
+            return
         if self.last_early_alert_time[token]:
-            if (datetime.now(IST) - self.last_early_alert_time[token]).total_seconds() < EARLY_WARNING_COOLDOWN: return 
+            if (datetime.now(IST) - self.last_early_alert_time[token]).total_seconds() < EARLY_WARNING_COOLDOWN:
+                return
 
         symbol = self.token_to_symbol[token]
         past_keys = [k for k in sorted(self.candles[token].keys()) if k < candle_time][-LOOKBACK_PERIOD:]
-        if len(past_keys) < LOOKBACK_PERIOD: return
-            
+        if len(past_keys) < LOOKBACK_PERIOD:
+            return
+
         resistance = max(self.candles[token][k]['high'] for k in past_keys)
         support = min(self.candles[token][k]['low'] for k in past_keys)
-        
+
         if current_ltp > resistance:
             msg = f"⚠️ <b>EARLY WARNING: {symbol}</b> ⚠️\nTime: {candle_time.strftime('%H:%M')}\nCrossed Res ({resistance:.2f})\nLTP: <b>{current_ltp:.2f}</b>"
             send_telegram_alert(msg)
@@ -305,51 +315,120 @@ class ArjunV2Engine:
             send_telegram_alert(msg)
             self.last_early_alert_time[token] = datetime.now(IST)
 
+    def calculate_ema(self, candles_list, period=20):
+        closes = [c['close'] for c in candles_list]
+        if len(closes) < period:
+            return sum(closes) / len(closes) if closes else 0
+
+        multiplier = 2 / (period + 1)
+        sma = sum(closes[:period]) / period
+        ema = sma
+        for close in closes[period:]:
+            ema = (close - ema) * multiplier + ema
+        return ema
+
+    def check_confirmation(self, candles_list, current_candle, option_type):
+        c_range = current_candle['high'] - current_candle['low']
+        if c_range <= 0:
+            return False, 0.0, "NONE"
+
+        body = abs(current_candle['close'] - current_candle['open'])
+        body_ratio = body / c_range
+
+        if body_ratio < 0.35:
+            return False, 0.0, "DOJI"
+
+        if option_type == "CE" and current_candle['close'] <= current_candle['open']:
+            return False, 0.0, "WRONG_COLOR"
+        if option_type == "PE" and current_candle['close'] >= current_candle['open']:
+            return False, 0.0, "WRONG_COLOR"
+
+        closes = [c['close'] for c in candles_list] + [current_candle['close']]
+        if len(closes) < 15:
+            return True, 50.0, "B+"
+
+        gains, losses = [], []
+        for i in range(1, len(closes)):
+            diff = closes[i] - closes[i - 1]
+            gains.append(max(diff, 0.0))
+            losses.append(abs(min(diff, 0.0)))
+
+        avg_gain = sum(gains[:14]) / 14.0
+        avg_loss = sum(losses[:14]) / 14.0
+        for i in range(14, len(gains)):
+            avg_gain = (avg_gain * 13 + gains[i]) / 14.0
+            avg_loss = (avg_loss * 13 + losses[i]) / 14.0
+
+        rsi = 100.0 if avg_loss == 0 else 100.0 - (100.0 / (1.0 + (avg_gain / avg_loss)))
+
+        if option_type == "CE" and (52.0 <= rsi <= 78.0):
+            grade = "🔥 A+" if body_ratio >= 0.55 else "✅ B+"
+            return True, rsi, grade
+        if option_type == "PE" and (22.0 <= rsi <= 48.0):
+            grade = "🔥 A+" if body_ratio >= 0.55 else "✅ B+"
+            return True, rsi, grade
+
+        return False, rsi, "RSI_OUT"
+
     def evaluate_final_candle(self, token, candle):
-        if not self.is_ready[token]: return
+        if not self.is_ready[token]:
+            return
         symbol = self.token_to_symbol[token]
 
         past_keys = [k for k in sorted(self.candles[token].keys()) if k < candle['time']]
-        if len(past_keys) < LOOKBACK_PERIOD + ATR_PERIOD: return
+        if len(past_keys) < LOOKBACK_PERIOD + ATR_PERIOD:
+            return
 
-        recent_candles = [self.candles[token][k] for k in past_keys[-(ATR_PERIOD + 1):]]
+        all_past_candles = [self.candles[token][k] for k in past_keys]
+
+        recent_candles = all_past_candles[-(ATR_PERIOD + 1):]
         tr_values = [
-            max(recent_candles[i]['high'] - recent_candles[i]['low'], abs(recent_candles[i]['high'] - recent_candles[i-1]['close']), abs(recent_candles[i]['low'] - recent_candles[i-1]['close']))
+            max(recent_candles[i]['high'] - recent_candles[i]['low'], abs(recent_candles[i]['high'] - recent_candles[i - 1]['close']), abs(recent_candles[i]['low'] - recent_candles[i - 1]['close']))
             for i in range(1, len(recent_candles))
         ]
         atr = sum(tr_values) / len(tr_values) if tr_values else 0
 
-        lookback_candles = [self.candles[token][k] for k in past_keys[-LOOKBACK_PERIOD:]]
+        lookback_candles = all_past_candles[-LOOKBACK_PERIOD:]
         resistance = max(c['high'] for c in lookback_candles)
         support = min(c['low'] for c in lookback_candles)
+
+        ema20 = self.calculate_ema(all_past_candles, 20)
 
         curr_close = candle['close']
         signal, spot_sl, option_type = None, 0, None
 
-        if curr_close > resistance:
+        if curr_close > resistance and curr_close > ema20:
             signal = "🟢 GREEN BUY CALL (CE) 🟢"
             spot_sl = curr_close - (atr * ATR_MULTIPLIER)
             option_type = "CE"
-        elif curr_close < support:
+        elif curr_close < support and curr_close < ema20:
             signal = "🔴 RED BUY PUT (PE) 🔴"
             spot_sl = curr_close + (atr * ATR_MULTIPLIER)
             option_type = "PE"
 
         if signal:
+            is_confirmed, rsi_val, grade = self.check_confirmation(all_past_candles, candle, option_type)
+            if not is_confirmed:
+                logging.info(f"🚫 {symbol} {option_type} skipped ({grade}, RSI={rsi_val:.1f})")
+                return
+
             last_time = self.last_signal_time_ce[token] if option_type == "CE" else self.last_signal_time_pe[token]
             if last_time and (datetime.now(IST) - last_time).total_seconds() < SIGNAL_COOLDOWN:
-                return 
+                return
 
             premium, atm_strike = self.get_atm_option(symbol, curr_close, option_type)
-            
-            if option_type == "CE": self.last_signal_time_ce[token] = datetime.now(IST)
-            else: self.last_signal_time_pe[token] = datetime.now(IST)
+
+            if option_type == "CE":
+                self.last_signal_time_ce[token] = datetime.now(IST)
+            else:
+                self.last_signal_time_pe[token] = datetime.now(IST)
 
             self.last_final_alert_time[token] = candle['time']
-            
-            msg = f"🚨 <b>{signal}</b> 🚨\nIndex: <b>{symbol}</b> | Time: {candle['time'].strftime('%H:%M')}\n\n"
+
+            msg = f"🚨 <b>{signal}</b> 🚨\nIndex: <b>{symbol}</b> | Time: {candle['time'].strftime('%H:%M')}\n"
+            msg += f"<b>Quality:</b> {grade} | <b>RSI:</b> {rsi_val:.1f}\n\n"
             msg += f"<b>--- SPOT INDEX ---</b>\nSpot Close: {curr_close:.2f}\nSpot SL: {spot_sl:.2f}\n\n"
-            
+
             if premium:
                 if symbol == 'NIFTY':
                     sl_pts, tgt_pts = NIFTY_SL_POINTS, NIFTY_TGT_POINTS
@@ -357,17 +436,17 @@ class ArjunV2Engine:
                     sl_pts, tgt_pts = BANKNIFTY_SL_POINTS, BANKNIFTY_TGT_POINTS
 
                 opt_target = premium + tgt_pts
-                opt_sl = max(1.0, premium - sl_pts) 
-                
+                opt_sl = max(1.0, premium - sl_pts)
+
                 msg += (f"<b>--- OPTION PREMIUM ---</b>\n"
                         f"ATM Strike: {atm_strike} {option_type}\n"
                         f"Est. Premium: ₹{premium:.2f}\n"
                         f"<b>Option Target: ₹{opt_target:.2f}</b> (+{tgt_pts})\n"
                         f"<b>Option SL: ₹{opt_sl:.2f}</b> (-{sl_pts})\n\n")
             else:
-                msg += f"<i>(Option premium data unavailable. Trade manually based on spot.)</i>\n\n"
-                
-            msg += f"<i>Note: Cooldown active for 1 hour.</i>"
+                msg += "<i>(Option premium data unavailable. Trade manually based on spot.)</i>\n\n"
+
+            msg += "<i>Note: Cooldown active for 1 hour.</i>"
             send_telegram_alert(msg)
 
     def market_close_monitor(self):
@@ -375,18 +454,19 @@ class ArjunV2Engine:
             if datetime.now(IST).time() >= datetime.strptime("15:00", "%H:%M").time():
                 send_telegram_alert("🔔 <b>ARJUN V2.1: Market Closed (3:00 PM). Shutting down.</b>")
                 if self.sws:
-                    try: self.sws.close_connection()
-                    except: pass
+                    try:
+                        self.sws.close_connection()
+                    except Exception:
+                        pass
                 break
             time.sleep(30)
 
     def start(self):
-        while not self.login(): time.sleep(10)
-        
-        # 1. ਸਵੇਰ ਦਾ ਮੂਡ ਕਾਰਡ ਭੇਜੋ
+        while not self.login():
+            time.sleep(10)
+
         self.send_morning_mood_summary()
-        
-        self.load_scrip_master() 
+        self.load_scrip_master()
         self.fetch_historical_data()
 
         threading.Thread(target=self.market_close_monitor, daemon=True).start()
@@ -398,12 +478,17 @@ class ArjunV2Engine:
             except Exception as e:
                 logging.error(f"WebSocket Crash: {e}")
 
-            if datetime.now(IST).time() >= datetime.strptime("15:00", "%H:%M").time(): break
+            if datetime.now(IST).time() >= datetime.strptime("15:00", "%H:%M").time():
+                break
             time.sleep(5)
-            if self.login(): self.fetch_historical_data()
+            if self.login():
+                self.fetch_historical_data()
+
 
 if __name__ == "__main__":
     send_telegram_alert("✅ <b>ARJUN V2.1 Engine Starting...</b>")
     engine = ArjunV2Engine()
-    try: engine.start()
-    except KeyboardInterrupt: send_telegram_alert("🛑 <b>Bot STOPPED</b>")
+    try:
+        engine.start()
+    except KeyboardInterrupt:
+        send_telegram_alert("🛑 <b>Bot STOPPED</b>")
