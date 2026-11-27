@@ -407,11 +407,33 @@ class ArjunV2Engine:
             option_type = "PE"
 
         if signal:
+            # 1. Normal Confirmation (Body, RSI)
             is_confirmed, rsi_val, grade = self.check_confirmation(all_past_candles, candle, option_type)
             if not is_confirmed:
                 logging.info(f"🚫 {symbol} {option_type} skipped ({grade}, RSI={rsi_val:.1f})")
                 return
 
+            # 2. CRT Liquidity Sweep Check (FIXED)
+            crt_confirmed = False
+            for i in range(1, min(7, len(all_past_candles) - LOOKBACK_PERIOD)):
+                sweep_candle = all_past_candles[-i]
+                prior_box = all_past_candles[-(LOOKBACK_PERIOD + i):-i]
+                
+                prior_res = max(c['high'] for c in prior_box)
+                prior_sup = min(c['low'] for c in prior_box)
+
+                if option_type == "CE" and sweep_candle['low'] < prior_sup and sweep_candle['close'] > prior_sup:
+                    crt_confirmed = True
+                    break
+                if option_type == "PE" and sweep_candle['high'] > prior_res and sweep_candle['close'] < prior_res:
+                    crt_confirmed = True
+                    break
+
+            if crt_confirmed:
+                grade = "🔥 A+ (CRT Sweep)"
+                logging.info(f"✅ CRT Liquidity Sweep Confirmed for {symbol}.")
+
+            # 3. Cooldown Check
             last_time = self.last_signal_time_ce[token] if option_type == "CE" else self.last_signal_time_pe[token]
             if last_time and (datetime.now(IST) - last_time).total_seconds() < SIGNAL_COOLDOWN:
                 return
@@ -427,68 +449,4 @@ class ArjunV2Engine:
 
             msg = f"🚨 <b>{signal}</b> 🚨\nIndex: <b>{symbol}</b> | Time: {candle['time'].strftime('%H:%M')}\n"
             msg += f"<b>Quality:</b> {grade} | <b>RSI:</b> {rsi_val:.1f}\n\n"
-            msg += f"<b>--- SPOT INDEX ---</b>\nSpot Close: {curr_close:.2f}\nSpot SL: {spot_sl:.2f}\n\n"
-
-            if premium:
-                if symbol == 'NIFTY':
-                    sl_pts, tgt_pts = NIFTY_SL_POINTS, NIFTY_TGT_POINTS
-                else:
-                    sl_pts, tgt_pts = BANKNIFTY_SL_POINTS, BANKNIFTY_TGT_POINTS
-
-                opt_target = premium + tgt_pts
-                opt_sl = max(1.0, premium - sl_pts)
-
-                msg += (f"<b>--- OPTION PREMIUM ---</b>\n"
-                        f"ATM Strike: {atm_strike} {option_type}\n"
-                        f"Est. Premium: ₹{premium:.2f}\n"
-                        f"<b>Option Target: ₹{opt_target:.2f}</b> (+{tgt_pts})\n"
-                        f"<b>Option SL: ₹{opt_sl:.2f}</b> (-{sl_pts})\n\n")
-            else:
-                msg += "<i>(Option premium data unavailable. Trade manually based on spot.)</i>\n\n"
-
-            msg += "<i>Note: Cooldown active for 1 hour.</i>"
-            send_telegram_alert(msg)
-
-    def market_close_monitor(self):
-        while True:
-            if datetime.now(IST).time() >= datetime.strptime("15:00", "%H:%M").time():
-                send_telegram_alert("🔔 <b>ARJUN V2.1: Market Closed (3:00 PM). Shutting down.</b>")
-                if self.sws:
-                    try:
-                        self.sws.close_connection()
-                    except Exception:
-                        pass
-                break
-            time.sleep(30)
-
-    def start(self):
-        while not self.login():
-            time.sleep(10)
-
-        self.send_morning_mood_summary()
-        self.load_scrip_master()
-        self.fetch_historical_data()
-
-        threading.Thread(target=self.market_close_monitor, daemon=True).start()
-
-        while True:
-            try:
-                self.init_websocket()
-                self.sws.connect()
-            except Exception as e:
-                logging.error(f"WebSocket Crash: {e}")
-
-            if datetime.now(IST).time() >= datetime.strptime("15:00", "%H:%M").time():
-                break
-            time.sleep(5)
-            if self.login():
-                self.fetch_historical_data()
-
-
-if __name__ == "__main__":
-    send_telegram_alert("✅ <b>ARJUN V2.1 Engine Starting...</b>")
-    engine = ArjunV2Engine()
-    try:
-        engine.start()
-    except KeyboardInterrupt:
-        send_telegram_alert("🛑 <b>Bot STOPPED</b>")
+            msg += f"<b>--- SPOT INDEX ---</b>\nSpot Close: {curr_close:.2f}\nSpot SL: {spot_sl:.2
