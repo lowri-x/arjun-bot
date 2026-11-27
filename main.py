@@ -447,7 +447,6 @@ class ArjunV2Engine:
 
             self.last_final_alert_time[token] = candle['time']
 
-            # ✅ FIX: ਇਹ ਲਾਈਨ ਪੂਰੀ ਕਰ ਦਿੱਤੀ ਗਈ ਹੈ
             msg = f"🚨 <b>{signal}</b> 🚨\nIndex: <b>{symbol}</b> | Time: {candle['time'].strftime('%H:%M')}\n"
             msg += f"<b>Quality:</b> {grade} | <b>RSI:</b> {rsi_val:.1f}\n\n"
-            msg += f"<b>--- SPOT INDEX ---</b>\nS
+            msg += f"<b>--- SPOT INDEX ---</b>\nSpot Close: {curr_close:.2f}\nSpot SL: {spot_sl:.2
