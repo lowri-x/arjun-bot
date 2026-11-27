@@ -447,6 +447,71 @@ class ArjunV2Engine:
 
             self.last_final_alert_time[token] = candle['time']
 
+            # ✅ ਇੱਥੇ ਲਾਈਨ ਪੂਰੀ ਤਰ੍ਹਾਂ ਨਾਲ ਠੀਕ ਹੈ
             msg = f"🚨 <b>{signal}</b> 🚨\nIndex: <b>{symbol}</b> | Time: {candle['time'].strftime('%H:%M')}\n"
             msg += f"<b>Quality:</b> {grade} | <b>RSI:</b> {rsi_val:.1f}\n\n"
-            msg += f"<b>--- SPOT INDEX ---</b>\nSpot Close: {curr_close:.2f}\nSpot SL: {spot_sl:.2
+            msg += f"<b>--- SPOT INDEX ---</b>\nSpot Close: {curr_close:.2f}\nSpot SL: {spot_sl:.2f}\n\n"
+
+            if premium:
+                if symbol == 'NIFTY':
+                    sl_pts, tgt_pts = NIFTY_SL_POINTS, NIFTY_TGT_POINTS
+                else:
+                    sl_pts, tgt_pts = BANKNIFTY_SL_POINTS, BANKNIFTY_TGT_POINTS
+
+                opt_target = premium + tgt_pts
+                opt_sl = max(1.0, premium - sl_pts)
+
+                msg += (f"<b>--- OPTION PREMIUM ---</b>\n"
+                        f"ATM Strike: {atm_strike} {option_type}\n"
+                        f"Est. Premium: ₹{premium:.2f}\n"
+                        f"<b>Option Target: ₹{opt_target:.2f}</b> (+{tgt_pts})\n"
+                        f"<b>Option SL: ₹{opt_sl:.2f}</b> (-{sl_pts})\n\n")
+            else:
+                msg += "<i>(Option premium data unavailable. Trade manually based on spot.)</i>\n\n"
+
+            msg += "<i>Note: Cooldown active for 1 hour.</i>"
+            send_telegram_alert(msg)
+
+    def market_close_monitor(self):
+        while True:
+            if datetime.now(IST).time() >= datetime.strptime("15:00", "%H:%M").time():
+                send_telegram_alert("🔔 <b>ARJUN V2.1: Market Closed (3:00 PM). Shutting down.</b>")
+                if self.sws:
+                    try:
+                        self.sws.close_connection()
+                    except Exception:
+                        pass
+                break
+            time.sleep(30)
+
+    def start(self):
+        while not self.login():
+            time.sleep(10)
+
+        self.send_morning_mood_summary()
+        self.load_scrip_master()
+        self.fetch_historical_data()
+
+        threading.Thread(target=self.market_close_monitor, daemon=True).start()
+
+        while True:
+            try:
+                self.init_websocket()
+                self.sws.connect()
+            except Exception as e:
+                logging.error(f"WebSocket Crash: {e}")
+
+            if datetime.now(IST).time() >= datetime.strptime("15:00", "%H:%M").time():
+                break
+            time.sleep(5)
+            if self.login():
+                self.fetch_historical_data()
+
+
+if __name__ == "__main__":
+    send_telegram_alert("✅ <b>ARJUN V2.1 Engine Starting...</b>")
+    engine = ArjunV2Engine()
+    try:
+        engine.start()
+    except KeyboardInterrupt:
+        send_telegram_alert("🛑 <b>Bot STOPPED</b>")
